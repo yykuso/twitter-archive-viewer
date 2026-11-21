@@ -4,19 +4,20 @@ import { h, linkify } from './dom.ts';
 import { createFeed, emptyBox, errorBox, spinner } from './feed.ts';
 import { formatDateTime, formatDay, dayKey } from './format.ts';
 import { openLightbox } from './lightbox.ts';
-import { dmHash } from './route.ts';
+import { dmHash, dmListHash } from './route.ts';
+import type { Scope } from './account.ts';
 import { removedBadge } from './tweet.ts';
 import type { View } from './timeline.ts';
 
 const VIDEO_RE = /\.(mp4|mov|webm|m4v)(\?|$)/i;
 
-export const createDmList = (): View => {
+export const createDmList = (scope: Scope): View => {
   const body = h('div', { class: 'dm-list' });
   const el = h('section', { class: 'view view-dm' }, h('div', { class: 'subhead' }, h('span', null, 'ダイレクトメッセージ')), body);
   let alive = true;
 
   const row = (c: DmConversation): HTMLElement =>
-    h('a', { class: 'dm-row', href: dmHash(c.id) },
+    h('a', { class: 'dm-row', href: dmHash(c.id, scope.account) },
       h('div', { class: 'dm-row-main' },
         h('div', { class: 'dm-names' }, c.isGroup ? h('span', { class: 'badge badge-group' }, 'グループ') : null, c.participants.join(', ') || c.id),
         h('div', { class: 'dm-meta' }, `${c.messageCount.toLocaleString('ja-JP')} 件`)),
@@ -24,7 +25,7 @@ export const createDmList = (): View => {
 
   const load = (): void => {
     body.replaceChildren(spinner());
-    fetchConversations().then((list) => {
+    fetchConversations(scope.account).then((list) => {
       if (!alive) return;
       body.replaceChildren(...(list.length === 0 ? [emptyBox('該当なし')] : list.map(row)));
     }).catch((e: unknown) => {
@@ -64,12 +65,12 @@ const renderMessage = (m: DmMessage, showSender: boolean): HTMLElement =>
       removedBadge(m.removedAt),
       h('time', { class: 'dm-time', datetime: m.createdAt }, formatDateTime(m.createdAt).slice(11))));
 
-export const createDmThread = (id: string): View => {
+export const createDmThread = (scope: Scope, id: string): View => {
   let lastDay = '';
   const feed = createFeed<DmMessage>({
     mode: 'button',
     emptyText: 'メッセージがありません',
-    load: (cursor) => fetchMessages(id, cursor),
+    load: (cursor) => fetchMessages(scope.account, id, cursor),
     render: (m) => {
       const day = dayKey(m.createdAt);
       const frag = document.createDocumentFragment();
@@ -82,7 +83,7 @@ export const createDmThread = (id: string): View => {
     },
   });
   const el = h('section', { class: 'view view-dm-thread' },
-    h('div', { class: 'subhead' }, h('a', { class: 'btn', href: '#/dm' }, '← 一覧'), h('span', null, 'DM')),
+    h('div', { class: 'subhead' }, h('a', { class: 'btn', href: dmListHash(scope.account) }, '← 一覧'), h('span', null, 'DM')),
     h('div', { class: 'dm-thread' }, feed.el));
   return { el, destroy: feed.destroy };
 };

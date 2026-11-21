@@ -3,19 +3,20 @@ import { fetchTweetDetail } from './api.ts';
 import { h } from './dom.ts';
 import { errorBox, spinner } from './feed.ts';
 import type { View } from './timeline.ts';
+import type { Scope } from './account.ts';
 import { renderTweet } from './tweet.ts';
 
-export const createDetail = (username: string | null, id: string): View => {
+export const createDetail = (scope: Scope, id: string): View => {
   const body = h('div', { class: 'detail-body' });
   const el = h('section', { class: 'view view-detail' },
     h('div', { class: 'subhead' }, h('button', { type: 'button', class: 'btn', onclick: () => history.back() }, '← 戻る'), h('span', null, 'ツイート')),
     body);
-  const ctx = { username, terms: [] as string[] };
+  const ctx = { ...scope, terms: [] as string[] };
   let alive = true;
 
   const load = (): void => {
     body.replaceChildren(spinner());
-    fetchTweetDetail(id).then((d) => {
+    fetchTweetDetail(scope.account, id).then((d) => {
       if (!alive) return;
       const card = (t: Tweet, role: 'parent' | 'main' | 'reply'): HTMLElement => renderTweet(t, ctx, { large: role === 'main', role });
       body.replaceChildren(

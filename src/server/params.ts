@@ -44,6 +44,14 @@ export const dayStartMs = (raw: string, name: string, timeZone: string): number 
   return ms;
 };
 
+/** `year=YYYY` (1970-2999)。不正なら 400 */
+export const parseYear = (raw: string | null): number => {
+  if (raw === null || !/^\d{4}$/.test(raw)) throw new HttpError(400, 'invalid year');
+  const y = Number(raw);
+  if (y < 1970 || y > 2999) throw new HttpError(400, 'invalid year');
+  return y;
+};
+
 export const encodeCursor = (createdAt: number, id: string): string => `${createdAt}_${id}`;
 
 export const parseKeysetCursor = (raw: string | null): KeysetCursor | null => {

@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS tweets (
   data_from      INTEGER NOT NULL  -- 内容列の値を取ったアーカイブの生成日時 (新しいものだけで上書き)
 );
 CREATE INDEX IF NOT EXISTS tweets_created ON tweets (created_at, id);
+-- 統計用カバリングインデックス (テーブル本体を読まずに 1 回の走査で集計する)
+CREATE INDEX IF NOT EXISTS tweets_stats ON tweets (created_at, is_reply, is_retweet, has_media, deleted_at);
 CREATE INDEX IF NOT EXISTS tweets_reply_to ON tweets (in_reply_to_status_id);
 
 CREATE TABLE IF NOT EXISTS media (

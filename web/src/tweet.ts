@@ -3,10 +3,9 @@ import { h, linkify } from './dom.ts';
 import { formatCount, formatDateTime, formatDay } from './format.ts';
 import { openLightbox } from './lightbox.ts';
 import { tweetHash } from './route.ts';
+import type { Scope } from './account.ts';
 
-export type TweetCtx = {
-  /** 自分のアカウント名 (原文リンク用)。不明なら null */
-  readonly username: string | null;
+export type TweetCtx = Scope & {
   readonly terms: readonly string[];
 };
 
@@ -62,13 +61,13 @@ export const renderTweet = (t: Tweet, ctx: TweetCtx, opts: CardOptions = {}): HT
   if (rb) badges.push(rb);
 
   const header = h('div', { class: 'tw-head' },
-    h('a', { class: 'tw-date', href: tweetHash(t.id) }, h('time', { datetime: t.createdAt }, formatDateTime(t.createdAt))),
+    h('a', { class: 'tw-date', href: tweetHash(t.id, ctx.account) }, h('time', { datetime: t.createdAt }, formatDateTime(t.createdAt))),
     badges,
     h('a', { class: 'tw-ext', href: originalUrl(ctx, t.id), target: '_blank', rel: 'noopener noreferrer', title: 'X で開く' }, 'X ↗'));
 
   const reply = t.replyTo
     ? h('div', { class: 'tw-reply' },
-        h('a', { href: tweetHash(t.replyTo.id) }, t.replyTo.screenName ? `↩ @${t.replyTo.screenName} への返信` : '↩ 返信'))
+        h('a', { href: tweetHash(t.replyTo.id, ctx.account) }, t.replyTo.screenName ? `↩ @${t.replyTo.screenName} への返信` : '↩ 返信'))
     : null;
 
   return h('article', { class: `tweet${opts.large ? ' tweet-large' : ''}${opts.role ? ` tweet-${opts.role}` : ''}`, 'data-id': t.id },

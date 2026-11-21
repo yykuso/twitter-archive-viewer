@@ -1,26 +1,28 @@
 import type { Like } from '../../src/shared/types.ts';
 import { fetchLikes } from './api.ts';
-import { debounce, h, linkify, termsOf } from './dom.ts';
+import { h, linkify, termsOf } from './dom.ts';
 import { createFeed, type Feed } from './feed.ts';
 import { likesHash } from './route.ts';
 import { removedBadge } from './tweet.ts';
 import type { View } from './timeline.ts';
+import type { Scope } from './account.ts';
 
 export type LikesView = View & { readonly update: (q: string) => void };
 
-export const createLikes = (initialQ: string): LikesView => {
+export const createLikes = (scope: Scope, initialQ: string): LikesView => {
   let q = initialQ;
   let feed: Feed | null = null;
   const host = h('div', { class: 'feed-host' });
-  const search = h('input', { type: 'search', class: 'search', placeholder: 'いいねを検索', 'aria-label': 'いいねを検索', enterkeyhint: 'search', autocomplete: 'off' });
+  const search = h('input', { type: 'search', class: 'search', placeholder: 'いいねを検索 (Enter)', 'aria-label': 'いいねを検索', enterkeyhint: 'search', autocomplete: 'off' });
   search.value = initialQ;
 
   const navigate = (): void => {
-    const hash = likesHash(search.value.trim());
+    const hash = likesHash(search.value.trim(), scope.account);
     if (location.hash !== hash) location.hash = hash;
   };
-  search.addEventListener('input', debounce(navigate, 300));
-  search.addEventListener('keydown', (e) => { if (e.key === 'Enter') navigate(); });
+  // 入力中は検索しない (IME 変換中の Enter も無視)。Enter で確定、または空にしたときだけ検索する
+  search.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) navigate(); });
+  search.addEventListener('input', () => { if (search.value === '') navigate(); });
 
   const mount = (query: string): void => {
     feed?.destroy();
@@ -28,7 +30,7 @@ export const createLikes = (initialQ: string): LikesView => {
     feed = createFeed<Like>({
       mode: 'scroll',
       emptyText: '該当なし',
-      load: (cursor) => fetchLikes(query || undefined, cursor),
+      load: (cursor) => fetchLikes(scope.account, query || undefined, cursor),
       render: (l) => h('article', { class: 'tweet like' },
         h('p', { class: 'tw-text' }, linkify(l.text, terms)),
         h('div', { class: 'tw-head' },

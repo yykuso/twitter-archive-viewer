@@ -1,9 +1,10 @@
 import type { MonthCount, RemovedFilter, Tweet, TweetQuery, TweetType } from '../../src/shared/types.ts';
 import { fetchCalendar, fetchTweets } from './api.ts';
-import { debounce, h, termsOf } from './dom.ts';
+import { h, termsOf } from './dom.ts';
 import { createFeed, type Feed } from './feed.ts';
 import { monthRange } from './format.ts';
 import { sameQuery, timelineHash } from './route.ts';
+import type { Scope } from './account.ts';
 import { renderTweet } from './tweet.ts';
 
 export type View = {
@@ -38,12 +39,12 @@ const buildMonthSelect = (months: readonly MonthCount[], onPick: (month: string)
   return select;
 };
 
-export const createTimeline = (username: string | null, initial: TweetQuery): TimelineView => {
+export const createTimeline = (scope: Scope, initial: TweetQuery): TimelineView => {
   let current: TweetQuery = initial;
   let feed: Feed | null = null;
 
   const feedHost = h('div', { class: 'feed-host' });
-  const search = h('input', { type: 'search', class: 'search', placeholder: 'ツイートを検索', 'aria-label': 'ツイートを検索', enterkeyhint: 'search', autocomplete: 'off' });
+  const search = h('input', { type: 'search', class: 'search', placeholder: 'ツイートを検索 (Enter)', 'aria-label': 'ツイートを検索', enterkeyhint: 'search', autocomplete: 'off' });
   const typeSel = h('select', { 'aria-label': '種類' }, TYPE_LABELS.map(([v, l]) => h('option', { value: v }, l)));
   const media = h('input', { type: 'checkbox' });
   const from = h('input', { type: 'date', 'aria-label': '期間(開始)' });
@@ -65,11 +66,10 @@ export const createTimeline = (username: string | null, initial: TweetQuery): Ti
   });
 
   const navigate = (): void => {
-    const hash = timelineHash(readQuery());
+    const hash = timelineHash(readQuery(), scope.account);
     if (location.hash === hash) return;
     location.hash = hash;
   };
-  const navigateDebounced = debounce(navigate, 300);
 
   const syncControls = (q: TweetQuery): void => {
     if (document.activeElement !== search) search.value = q.q ?? '';
@@ -86,18 +86,19 @@ export const createTimeline = (username: string | null, initial: TweetQuery): Ti
   const mountFeed = (q: TweetQuery): void => {
     feed?.destroy();
     const terms = termsOf(q.q);
-    const ctx = { username, terms };
+    const ctx = { ...scope, terms };
     feed = createFeed<Tweet>({
       mode: 'scroll',
       emptyText: '該当なし',
-      load: (cursor) => fetchTweets({ ...q, ...(cursor ? { cursor } : {}) }),
+      load: (cursor) => fetchTweets(scope.account, { ...q, ...(cursor ? { cursor } : {}) }),
       render: (t) => renderTweet(t, ctx),
     });
     feedHost.replaceChildren(feed.el);
   };
 
-  search.addEventListener('input', navigateDebounced);
-  search.addEventListener('keydown', (e) => { if (e.key === 'Enter') navigate(); });
+  // 入力中は検索しない (IME 変換中の Enter も無視)。Enter で確定、または空にしたときだけ検索する
+  search.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) navigate(); });
+  search.addEventListener('input', () => { if (search.value === '') navigate(); });
   for (const c of [typeSel, media, from, to, order, removedSel]) c.addEventListener('change', navigate);
 
   const panel = h('div', { class: 'filters', id: 'filters' },
@@ -116,7 +117,7 @@ export const createTimeline = (username: string | null, initial: TweetQuery): Ti
   syncControls(initial);
   mountFeed(initial);
 
-  fetchCalendar().then((months) => {
+  fetchCalendar(scope.account).then((months) => {
     monthHost.replaceChildren(buildMonthSelect(months, (month) => {
       const r = monthRange(month);
       if (!r) return;

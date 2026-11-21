@@ -1,5 +1,7 @@
 import type {
+  AccountSummary,
   ArchiveFile,
+  DailyCount,
   DmConversation,
   DmMessage,
   ImportJob,
@@ -10,8 +12,12 @@ import type {
   Like,
   Meta,
   MonthCount,
+  MonthlyStats,
   Page,
   ResetRequest,
+  Settings,
+  SettingsRequest,
+  StatsSummary,
   TableStats,
   Tweet,
   TweetDetail,
@@ -34,11 +40,37 @@ const isConv = (v: unknown): v is DmConversation => isRecord(v) && typeof v['id'
 const isMsg = (v: unknown): v is DmMessage => isRecord(v) && typeof v['id'] === 'string' && typeof v['text'] === 'string' && Array.isArray(v['media']);
 const isMonth = (v: unknown): v is MonthCount => isRecord(v) && typeof v['month'] === 'string' && typeof v['count'] === 'number';
 
+const isStrOrNull = (v: unknown): v is string | null => v === null || typeof v === 'string';
+
 const isMeta = (v: unknown): v is Meta =>
   isRecord(v) &&
-  (v['account'] === null || (isRecord(v['account']) && typeof v['account']['username'] === 'string')) &&
+  (v['account'] === null ||
+    (isRecord(v['account']) && typeof v['account']['id'] === 'string' && typeof v['account']['username'] === 'string' && typeof v['account']['displayName'] === 'string')) &&
+  isRecord(v['profile']) && isStrOrNull(v['profile']['avatarUrl']) &&
+  typeof v['timezone'] === 'string' &&
   isRecord(v['counts']) &&
   typeof v['importCount'] === 'number';
+
+const isAccount = (v: unknown): v is AccountSummary =>
+  isRecord(v) && typeof v['id'] === 'string' && typeof v['username'] === 'string' && typeof v['displayName'] === 'string' &&
+  isStrOrNull(v['avatarUrl']) && typeof v['tweetCount'] === 'number' && isStrOrNull(v['lastImportedAt']);
+
+const isMonthly = (v: unknown): v is MonthlyStats =>
+  isRecord(v) && typeof v['month'] === 'string' && typeof v['original'] === 'number' && typeof v['reply'] === 'number' && typeof v['retweet'] === 'number';
+
+const TOTAL_KEYS = ['tweets', 'original', 'replies', 'retweets', 'withMedia', 'deleted', 'removed', 'likes', 'dmConversations', 'dmMessages'] as const;
+const isStats = (v: unknown): v is StatsSummary =>
+  isRecord(v) && isRecord(v['totals']) && TOTAL_KEYS.every((k) => typeof (v['totals'] as Record<string, unknown>)[k] === 'number') &&
+  isStrOrNull(v['first']) && isStrOrNull(v['last']) &&
+  Array.isArray(v['years']) && v['years'].every((y) => typeof y === 'number') &&
+  Array.isArray(v['monthly']) && v['monthly'].every(isMonthly);
+
+const isDaily = (v: unknown): v is DailyCount => isRecord(v) && typeof v['day'] === 'string' && typeof v['count'] === 'number';
+
+const isSettings = (v: unknown): v is Settings =>
+  isRecord(v) && typeof v['timezone'] === 'string' &&
+  (v['timezoneSource'] === 'settings' || v['timezoneSource'] === 'env' || v['timezoneSource'] === 'default') &&
+  isStrOrNull(v['envTimezone']);
 
 const STAGES: readonly string[] = ['queued', 'reading', 'writing', 'swapping', 'media', 'done', 'failed'];
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
@@ -48,7 +80,8 @@ const isImportStats = (v: unknown): v is ImportStats =>
   isRecord(v['removed']) && isNum(v['removed']['tweets']) && isNum(v['removed']['likes']) && isNum(v['removed']['dmMessages']) &&
   isNum(v['mediaFiles']);
 const isImportRecord = (v: unknown): v is ImportRecord =>
-  isRecord(v) && isNum(v['id']) && typeof v['fileName'] === 'string' && typeof v['generatedAt'] === 'string' &&
+  isRecord(v) && isNum(v['id']) && typeof v['accountId'] === 'string' && typeof v['username'] === 'string' &&
+  typeof v['fileName'] === 'string' && typeof v['generatedAt'] === 'string' &&
   typeof v['finishedAt'] === 'string' && isImportStats(v['stats']);
 const isArchiveFile = (v: unknown): v is ArchiveFile =>
   isRecord(v) && typeof v['name'] === 'string' && isNum(v['size']) && typeof v['modifiedAt'] === 'string' &&
@@ -56,6 +89,7 @@ const isArchiveFile = (v: unknown): v is ArchiveFile =>
 const isImportJob = (v: unknown): v is ImportJob =>
   isRecord(v) && typeof v['id'] === 'string' && typeof v['fileName'] === 'string' &&
   typeof v['stage'] === 'string' && STAGES.includes(v['stage']) && typeof v['startedAt'] === 'string' &&
+  (v['account'] === null || (isRecord(v['account']) && typeof v['account']['id'] === 'string' && typeof v['account']['username'] === 'string')) &&
   (v['progress'] === null || (isRecord(v['progress']) && isNum(v['progress']['done']) && isNum(v['progress']['total']))) &&
   (v['stats'] === null || isImportStats(v['stats']));
 export const isStage = (v: string): v is ImportStage => STAGES.includes(v);
@@ -98,8 +132,8 @@ const request = async (url: string, init: RequestInit): Promise<unknown> => {
   }
   if (!res.ok) {
     const msg = isRecord(body) && typeof body['error'] === 'string' ? body['error'] : `HTTP ${res.status}`;
-    // 409 (実行中) は想定内の競合なので警告に留める。UI 側で表示する
-    (res.status === 409 ? console.warn : console.error)(`[api] ${method} ${url} failed: ${msg}`);
+    // 409 (実行中) と 404 (削除済みアカウントなど) は呼び出し側が扱う想定内の応答なので警告に留める
+    (res.status === 409 || res.status === 404 ? console.warn : console.error)(`[api] ${method} ${url} failed: ${msg}`);
     throw new ApiFailure(msg, res.status);
   }
   return body;
@@ -123,13 +157,30 @@ const expect = <T>(url: string, body: unknown, guard: (v: unknown) => v is T, wh
   return body;
 };
 
-export const fetchMeta = async (): Promise<Meta> => {
-  const url = '/api/meta';
+/** 配列、または { items: [...] } のどちらでも受け付ける */
+const listOf = (body: unknown): unknown => (Array.isArray(body) ? body : isRecord(body) ? body['items'] : undefined);
+
+/** account は未指定なら省略 (サーバーの既定アカウント) */
+export type Account = string | undefined;
+
+export const fetchAccounts = async (): Promise<readonly AccountSummary[]> => {
+  const url = '/api/accounts';
+  const list = listOf(await getJson(url));
+  if (!Array.isArray(list) || !list.every(isAccount)) {
+    console.error(`[api] unexpected shape for accounts: ${url}`, list);
+    throw new ApiFailure('アカウント一覧の形式が想定と異なります', 0);
+  }
+  return list;
+};
+
+export const fetchMeta = async (account: Account): Promise<Meta> => {
+  const url = buildUrl('/api/meta', { account });
   return expect(url, await getJson(url), isMeta, 'meta');
 };
 
-export const fetchTweets = async (q: TweetQuery): Promise<Page<Tweet>> => {
+export const fetchTweets = async (account: Account, q: TweetQuery): Promise<Page<Tweet>> => {
   const url = buildUrl('/api/tweets', {
+    account,
     q: q.q, from: q.from, to: q.to,
     type: q.type === 'all' ? undefined : q.type,
     media: q.media, order: q.order,
@@ -138,14 +189,14 @@ export const fetchTweets = async (q: TweetQuery): Promise<Page<Tweet>> => {
   return expect(url, await getJson(url), isPageOf(isTweetLike), 'tweets');
 };
 
-export const fetchTweetDetail = async (id: string): Promise<TweetDetail> => {
-  const url = `/api/tweets/${encodeURIComponent(id)}`;
+export const fetchTweetDetail = async (account: Account, id: string): Promise<TweetDetail> => {
+  const url = buildUrl(`/api/tweets/${encodeURIComponent(id)}`, { account });
   return expect(url, await getJson(url), isTweetDetail, 'tweet');
 };
 
 /** 配列、または { months | items: [...] } のどちらでも受け付ける */
-export const fetchCalendar = async (): Promise<readonly MonthCount[]> => {
-  const url = '/api/calendar';
+export const fetchCalendar = async (account: Account): Promise<readonly MonthCount[]> => {
+  const url = buildUrl('/api/calendar', { account });
   const body = await getJson(url);
   const list = Array.isArray(body) ? body : isRecord(body) ? (body['months'] ?? body['items']) : undefined;
   if (!Array.isArray(list) || !list.every(isMonth)) {
@@ -155,26 +206,54 @@ export const fetchCalendar = async (): Promise<readonly MonthCount[]> => {
   return list;
 };
 
-export const fetchLikes = async (q: string | undefined, cursor: string | null): Promise<Page<Like>> => {
-  const url = buildUrl('/api/likes', { q, cursor: cursor ?? undefined });
+export const fetchLikes = async (account: Account, q: string | undefined, cursor: string | null): Promise<Page<Like>> => {
+  const url = buildUrl('/api/likes', { account, q, cursor: cursor ?? undefined });
   return expect(url, await getJson(url), isPageOf(isLike), 'likes');
 };
 
-/** 配列、または Page のどちらでも受け付ける */
-export const fetchConversations = async (): Promise<readonly DmConversation[]> => {
-  const url = '/api/dm';
-  const body = await getJson(url);
-  const list = Array.isArray(body) ? body : isRecord(body) ? body['items'] : undefined;
+export const fetchConversations = async (account: Account): Promise<readonly DmConversation[]> => {
+  const url = buildUrl('/api/dm', { account });
+  const list = listOf(await getJson(url));
   if (!Array.isArray(list) || !list.every(isConv)) {
-    console.error(`[api] unexpected shape for dm list: ${url}`, body);
+    console.error(`[api] unexpected shape for dm list: ${url}`, list);
     throw new ApiFailure('DM一覧の形式が想定と異なります', 0);
   }
   return list;
 };
 
-export const fetchMessages = async (id: string, cursor: string | null): Promise<Page<DmMessage>> => {
-  const url = buildUrl(`/api/dm/${encodeURIComponent(id)}`, { cursor: cursor ?? undefined });
+export const fetchMessages = async (account: Account, id: string, cursor: string | null): Promise<Page<DmMessage>> => {
+  const url = buildUrl(`/api/dm/${encodeURIComponent(id)}`, { account, cursor: cursor ?? undefined });
   return expect(url, await getJson(url), isPageOf(isMsg), 'dm messages');
+};
+
+// ---- 統計 ----
+
+export const fetchStats = async (account: Account): Promise<StatsSummary> => {
+  const url = buildUrl('/api/stats', { account });
+  return expect(url, await getJson(url), isStats, 'stats');
+};
+
+export const fetchDaily = async (account: Account, year: number): Promise<readonly DailyCount[]> => {
+  const url = buildUrl('/api/stats/daily', { account, year: String(year) });
+  const list = listOf(await getJson(url));
+  if (!Array.isArray(list) || !list.every(isDaily)) {
+    console.error(`[api] unexpected shape for daily stats: ${url}`, list);
+    throw new ApiFailure('日別統計の形式が想定と異なります', 0);
+  }
+  return list;
+};
+
+// ---- 設定 ----
+
+export const fetchSettings = async (): Promise<Settings> => {
+  const url = '/api/settings';
+  return expect(url, await getJson(url), isSettings, 'settings');
+};
+
+export const saveSettings = async (timezone: string | null): Promise<Settings> => {
+  const url = '/api/admin/settings';
+  const req: SettingsRequest = { timezone };
+  return expect(url, await postJson(url, req), isSettings, 'settings');
 };
 
 // ---- 管理 ----
@@ -190,8 +269,8 @@ export const fetchArchives = async (): Promise<readonly ArchiveFile[]> => {
   return list;
 };
 
-export const fetchImports = async (): Promise<readonly ImportRecord[]> => {
-  const url = '/api/admin/imports';
+export const fetchImports = async (account: Account): Promise<readonly ImportRecord[]> => {
+  const url = buildUrl('/api/admin/imports', { account });
   const body = await getJson(url);
   const list = Array.isArray(body) ? body : isRecord(body) ? body['items'] : undefined;
   if (!Array.isArray(list) || !list.every(isImportRecord)) {
@@ -214,7 +293,7 @@ export const startImport = async (req: ImportRequest): Promise<ImportJob> => {
   return expect(url, await postJson(url, req), isImportJob, 'import job');
 };
 
-export const resetDatabase = async (): Promise<void> => {
-  const req: ResetRequest = { confirm: 'RESET' };
+export const resetDatabase = async (accountId: string): Promise<void> => {
+  const req: ResetRequest = { confirm: 'RESET', accountId };
   await postJson('/api/admin/reset', req);
 };

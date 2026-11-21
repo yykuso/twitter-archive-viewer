@@ -1,25 +1,27 @@
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { migrateLegacyLayout } from '../db/legacy.ts';
 import { config } from '../db/open.ts';
+import { settingsPathOf } from '../db/paths.ts';
 import { createAdmin } from './admin.ts';
-import { createDbHolder, prepareDbFile } from './db-holder.ts';
 import { applyCommonHeaders } from './http.ts';
-import { createQueries } from './queries.ts';
+import { createRegistry, prepareAccountDbs } from './registry.ts';
 import { createHandler } from './router.ts';
+import { createSettings } from './settings.ts';
 import { assertValidTimeZone, selfCheckTimeZone } from './timezone.ts';
 
 const webRoot = process.env['WEB_ROOT'] ?? fileURLToPath(new URL('../../web/dist', import.meta.url));
 
-assertValidTimeZone(config.timeZone);
+if (config.envTimeZone !== null) assertValidTimeZone(config.envTimeZone);
 selfCheckTimeZone();
 
-// 取り込み途中の .tmp を片付け、DB が無ければ空のスキーマだけの DB を作ってから読み取り専用で開く
-prepareDbFile(config.dbPath);
-const holder = createDbHolder(config.dbPath);
-holder.reopen();
-const queries = createQueries(holder, config.timeZone);
-const admin = createAdmin({ holder, queries, archiveDir: config.archiveDir, mediaRoot: config.mediaRoot });
-const handler = createHandler({ queries, admin, mediaRoot: config.mediaRoot, timeZone: config.timeZone, webRoot });
+// 旧レイアウト (単一 DB) の移行 → 取り込み途中の .tmp の掃除・旧スキーマの退避 → 設定の読み込み
+migrateLegacyLayout({ legacyDbPath: config.legacyDbPath, dbDir: config.dbDir, mediaRoot: config.mediaRoot });
+prepareAccountDbs(config.dbDir);
+const settings = createSettings({ path: settingsPathOf(config.dbDir), envTimeZone: config.envTimeZone });
+const registry = createRegistry({ dbDir: config.dbDir, getTimeZone: settings.timeZone });
+const admin = createAdmin({ registry, dbDir: config.dbDir, archiveDir: config.archiveDir, mediaRoot: config.mediaRoot });
+const handler = createHandler({ registry, settings, admin, mediaRoot: config.mediaRoot, webRoot });
 
 const server = createServer((req, res) => {
   const started = performance.now();
@@ -36,7 +38,7 @@ const shutdown = (signal: string): void => {
   admin.abort();
   server.close((err) => {
     try {
-      holder.close();
+      registry.closeAll();
     } catch (e) {
       console.error(`[main] db close failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -52,5 +54,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.listen(config.port, '0.0.0.0', () => {
-  console.log(`[main] listening on :${config.port} db=${config.dbPath} archive=${config.archiveDir} media=${config.mediaRoot} tz=${config.timeZone} web=${webRoot}`);
+  console.log(
+    `[main] listening on :${config.port} db=${config.dbDir} archive=${config.archiveDir} media=${config.mediaRoot} tz=${settings.timeZone()} (${settings.get().timezoneSource}) accounts=${registry.list().length} web=${webRoot}`,
+  );
 });

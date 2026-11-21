@@ -1,5 +1,7 @@
 import type { DatabaseSync, SQLInputValue, SQLOutputValue, StatementSync } from 'node:sqlite';
 import type {
+  AccountSummary,
+  DailyCount,
   DmConversation,
   DmMessage,
   ImportRecord,
@@ -9,11 +11,14 @@ import type {
   MediaType,
   Meta,
   MonthCount,
+  MonthlyStats,
   Page,
+  StatsSummary,
   Tweet,
   TweetDetail,
 } from '../shared/types.ts';
 import type { DbHolder } from './db-holder.ts';
+import { aggregateDaily, aggregateMonthly, dayBuckets, monthBuckets, yearsWithTweets, type StatRow } from './stats.ts';
 import { localMonth, nextMonth, zonedMidnightToUtc } from './timezone.ts';
 import { encodeCursor, type KeysetCursor, type TweetFilter } from './params.ts';
 
@@ -47,9 +52,9 @@ const numOrNull = (r: Row, k: string): number | null => {
 const toIso = (ms: number): string => new Date(ms).toISOString();
 const toIsoOrNull = (ms: number | null): string | null => (ms === null ? null : toIso(ms));
 
-/** メディア相対パス → URL (各セグメントを URL エンコード) */
-export const mediaUrl = (relPath: string): string =>
-  `/media/${relPath.split('/').map(encodeURIComponent).join('/')}`;
+/** メディア相対パス → `/media/<accountId>/...` の URL (各セグメントを URL エンコード) */
+export const mediaUrl = (accountId: string, relPath: string): string =>
+  `/media/${accountId}/${relPath.split('/').map(encodeURIComponent).join('/')}`;
 
 /** meta の日時値は ISO 文字列でも epoch ms でも受け付けて ISO に正規化する */
 export const normalizeInstant = (v: string | undefined): string | null => {
@@ -62,13 +67,13 @@ export const normalizeInstant = (v: string | undefined): string | null => {
 const isMediaType = (v: string): v is MediaType =>
   v === 'photo' || v === 'video' || v === 'animated_gif';
 
-export const toMedia = (r: Row): Media => {
+export const toMedia = (r: Row, accountId: string): Media => {
   const type = str(r, 'type');
   if (!isMediaType(type)) throw new Error(`unknown media type: ${type}`);
   const file = strOrNull(r, 'file');
   return {
     type,
-    url: file === null ? null : mediaUrl(file),
+    url: file === null ? null : mediaUrl(accountId, file),
     width: numOrNull(r, 'width'),
     height: numOrNull(r, 'height'),
   };
@@ -121,13 +126,13 @@ const parseReactions = (raw: string, what: string): DmMessage['reactions'] => {
   });
 };
 
-export const toDmMessage = (r: Row, myId: string): DmMessage => ({
+export const toDmMessage = (r: Row, myId: string, accountId: string): DmMessage => ({
   id: str(r, 'id'),
   senderId: str(r, 'sender_id'),
   isMine: str(r, 'sender_id') === myId,
   createdAt: toIso(num(r, 'created_at')),
   text: str(r, 'text'),
-  media: parseStringArray(str(r, 'media'), `dm_messages.media(${str(r, 'id')})`).map(mediaUrl),
+  media: parseStringArray(str(r, 'media'), `dm_messages.media(${str(r, 'id')})`).map((p) => mediaUrl(accountId, p)),
   reactions: parseReactions(str(r, 'reactions'), `dm_messages.reactions(${str(r, 'id')})`),
   removedAt: toIsoOrNull(numOrNull(r, 'removed_at')),
 });
@@ -295,8 +300,10 @@ export const parseImportStats = (raw: string, what: string): ImportStats => {
   };
 };
 
-export const toImportRecord = (r: Row): ImportRecord => ({
+export const toImportRecord = (r: Row, accountId: string, username: string): ImportRecord => ({
   id: num(r, 'id'),
+  accountId,
+  username,
   fileName: str(r, 'file_name'),
   fileSize: num(r, 'file_size'),
   generatedAt: toIso(num(r, 'generated_at')),
@@ -311,7 +318,7 @@ const IMPORT_COLS = 'id, file_name, file_size, generated_at, started_at, finishe
  * 現在のハンドル (holder.get()) に対するクエリ群。
  * 準備済み文のキャッシュと maxGeneratedAt はハンドル単位 (WeakMap) なので、reopen 後は自動的に作り直される。
  */
-export const createQueries = (holder: DbHolder, timeZone: string) => {
+export const createQueries = (holder: DbHolder, accountId: string, getTimeZone: () => string) => {
   const caches = new WeakMap<DatabaseSync, Map<string, StatementSync>>();
   const maxGenerated = new WeakMap<DatabaseSync, number | null>();
   const stmt = (sql: string): StatementSync => {
@@ -352,7 +359,7 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
     for (const r of rows) {
       const id = str(r, 'tweet_id');
       const list = byTweet.get(id) ?? [];
-      list.push(toMedia(r));
+      list.push(toMedia(r, accountId));
       byTweet.set(id, list);
     }
     return byTweet;
@@ -371,15 +378,30 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
     return r === undefined ? 0 : num(r, 'n');
   };
 
-  const myAccountId = (): string => {
-    const r = get("SELECT value FROM meta WHERE key = 'account_id'");
+  const metaValue = (key: string): string => {
+    const r = get('SELECT value FROM meta WHERE key = ?', key);
     return r === undefined ? '' : str(r, 'value');
   };
+  const myAccountId = (): string => metaValue('account_id');
+
+  /** 統計用: 準備済み文キャッシュを汚さないよう専用の文を作り、配列で行を返させる */
+  function* statRows(sql: string, params: readonly SQLInputValue[]): Generator<readonly SQLOutputValue[]> {
+    const st = holder.get().prepare(sql);
+    st.setReturnArrays(true);
+    yield* st.iterate(...params) as Iterable<readonly SQLOutputValue[]>;
+  }
+  const numAt = (row: readonly SQLOutputValue[], i: number): number => {
+    const v = row[i];
+    if (typeof v !== 'number') throw new Error(`stats: column ${i}: expected number, got ${typeof v}`);
+    return v;
+  };
+
+  const statsCache = new WeakMap<DatabaseSync, Map<string, StatsSummary>>();
 
   return {
     meta: (): Meta => {
       const m = metaMap();
-      const accountId = m.get('account_id');
+      const storedId = m.get('account_id');
       const range = get('SELECT MIN(created_at) AS first, MAX(created_at) AS last FROM tweets');
       const avatar = m.get('avatar_file');
       const first = range === undefined ? null : numOrNull(range, 'first');
@@ -387,17 +409,17 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
       const importCount = get('SELECT COUNT(*) AS n FROM imports');
       return {
         account:
-          accountId === undefined
+          storedId === undefined
             ? null
-            : { id: accountId, username: m.get('username') ?? '', displayName: m.get('display_name') ?? '' },
+            : { id: storedId, username: m.get('username') ?? '', displayName: m.get('display_name') ?? '' },
         profile: {
           bio: m.get('bio') ?? null,
-          avatarUrl: avatar === undefined || avatar === '' ? null : mediaUrl(avatar),
+          avatarUrl: avatar === undefined || avatar === '' ? null : mediaUrl(accountId, avatar),
         },
         archiveGeneratedAt: normalizeInstant(m.get('archive_generated_at')),
         importedAt: normalizeInstant(m.get('imported_at')),
         importCount: importCount === undefined ? 0 : num(importCount, 'n'),
-        timezone: timeZone,
+        timezone: getTimeZone(),
         counts: { tweets: count('tweets'), likes: count('likes'), dmConversations: count('dm_conversations') },
         range: { first: toIsoOrNull(first), last: toIsoOrNull(last) },
       };
@@ -405,7 +427,7 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
 
     /** 取り込み履歴 (新しい順) */
     imports: (): ImportRecord[] =>
-      all({ sql: `SELECT ${IMPORT_COLS} FROM imports ORDER BY id DESC`, params: [] }).map(toImportRecord),
+      all({ sql: `SELECT ${IMPORT_COLS} FROM imports ORDER BY id DESC`, params: [] }).map((r) => toImportRecord(r, accountId, metaValue('username'))),
 
     /** 同名・同サイズの ZIP の最新の取り込み記録 */
     latestImportOf: (fileName: string, fileSize: number): ImportRecord | null => {
@@ -414,7 +436,7 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
         fileName,
         fileSize,
       );
-      return r === undefined ? null : toImportRecord(r);
+      return r === undefined ? null : toImportRecord(r, accountId, metaValue('username'));
     },
 
     tweets: (f: TweetFilter): Page<Tweet> => {
@@ -445,6 +467,7 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
 
     /** 設定タイムゾーンでの月別件数。月の境界 (UTC ms) を求め、インデックス上の範囲 COUNT で数える (DST 対応) */
     calendar: (): MonthCount[] => {
+      const timeZone = getTimeZone();
       const range = get('SELECT MIN(created_at) AS first, MAX(created_at) AS last FROM tweets');
       const first = range === undefined ? null : numOrNull(range, 'first');
       const last = range === undefined ? null : numOrNull(range, 'last');
@@ -462,6 +485,81 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
         if (n > 0) result.push({ month, count: n });
       }
       return result;
+    },
+
+    /** アカウント一覧用の要約。account_id が無い (空の) DB なら null */
+    accountSummary: (): AccountSummary | null => {
+      const m = metaMap();
+      const id = m.get('account_id');
+      if (id === undefined || id === '') return null;
+      const last = get('SELECT MAX(finished_at) AS m FROM imports');
+      const avatar = m.get('avatar_file');
+      return {
+        id,
+        username: m.get('username') ?? '',
+        displayName: m.get('display_name') ?? '',
+        avatarUrl: avatar === undefined || avatar === '' ? null : mediaUrl(accountId, avatar),
+        tweetCount: count('tweets'),
+        lastImportedAt: toIsoOrNull(last === undefined ? null : numOrNull(last, 'm')),
+        archiveGeneratedAt: normalizeInstant(m.get('archive_generated_at')),
+      };
+    },
+
+    /** 統計。(DB ハンドル, タイムゾーン) ごとにメモリへキャッシュ (差し替え・リセットで DB を開き直すと自然に無効化される) */
+    stats: (): StatsSummary => {
+      const timeZone = getTimeZone();
+      const db = holder.get();
+      const cached = statsCache.get(db)?.get(timeZone);
+      if (cached !== undefined) return cached;
+      const range = get('SELECT MIN(created_at) AS first, MAX(created_at) AS last FROM tweets');
+      const first = range === undefined ? null : numOrNull(range, 'first');
+      const last = range === undefined ? null : numOrNull(range, 'last');
+      const { months, bounds } = first === null || last === null ? { months: [], bounds: [] } : monthBuckets(first, last, timeZone);
+      function* rows(): Generator<StatRow> {
+        for (const r of statRows(
+          'SELECT created_at, is_reply, is_retweet, has_media, deleted_at IS NOT NULL FROM tweets INDEXED BY tweets_stats ORDER BY created_at',
+          [],
+        )) {
+          yield { createdAt: numAt(r, 0), isReply: numAt(r, 1) !== 0, isRetweet: numAt(r, 2) !== 0, hasMedia: numAt(r, 3) !== 0, deleted: numAt(r, 4) !== 0 };
+        }
+      }
+      const agg = months.length === 0 ? null : aggregateMonthly(rows(), months, bounds);
+      const monthly: MonthlyStats[] = agg === null ? [] : agg.monthly;
+      const t = agg?.totals ?? { tweets: 0, original: 0, replies: 0, retweets: 0, withMedia: 0, deleted: 0 };
+      const maxG = maxGeneratedAt();
+      const removed = maxG === null ? undefined : get('SELECT COUNT(*) AS n FROM tweets WHERE last_seen_at < ?', maxG);
+      const dmMessages = get('SELECT COUNT(*) AS n FROM dm_messages');
+      const summary: StatsSummary = {
+        totals: {
+          ...t,
+          removed: removed === undefined ? 0 : num(removed, 'n'),
+          likes: count('likes'),
+          dmConversations: count('dm_conversations'),
+          dmMessages: dmMessages === undefined ? 0 : num(dmMessages, 'n'),
+        },
+        first: toIsoOrNull(first),
+        last: toIsoOrNull(last),
+        years: yearsWithTweets(monthly),
+        monthly,
+      };
+      const perTz = statsCache.get(db) ?? new Map<string, StatsSummary>();
+      perTz.set(timeZone, summary);
+      statsCache.set(db, perTz);
+      return summary;
+    },
+
+    /** 指定年の日別件数 (設定タイムゾーン, 0 件の日は除く, 昇順) */
+    dailyCounts: (year: number): DailyCount[] => {
+      const { days, bounds } = dayBuckets(year, getTimeZone());
+      const from = bounds[0] ?? 0;
+      const to = bounds[bounds.length - 1] ?? 0;
+      if (bounds.length < 2) throw new Error('stats: empty day buckets');
+      function* times(): Generator<number> {
+        for (const r of statRows('SELECT created_at FROM tweets WHERE created_at >= ? AND created_at < ? ORDER BY created_at', [from, to])) {
+          yield numAt(r, 0);
+        }
+      }
+      return aggregateDaily(times(), days, bounds);
     },
 
     likes: (terms: readonly string[], cursor: number | null, limit: number): Page<Like> => {
@@ -504,7 +602,7 @@ export const createQueries = (holder: DbHolder, timeZone: string) => {
               WHERE conversation_id = ?${cond} ORDER BY created_at ASC, id ASC LIMIT ?`,
         params,
       });
-      return toPage(rows, limit, (r) => toDmMessage(r, myId), (r) => encodeCursor(num(r, 'created_at'), str(r, 'id')));
+      return toPage(rows, limit, (r) => toDmMessage(r, myId, accountId), (r) => encodeCursor(num(r, 'created_at'), str(r, 'id')));
     },
   };
 };

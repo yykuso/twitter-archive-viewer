@@ -21,7 +21,8 @@ services:
     container_name: twitter-archive-viewer
     restart: unless-stopped
     environment:
-      - TIMEZONE=${TIMEZONE:-UTC}
+      # Empty = not set: the time zone can then be changed from the admin screen (default UTC) / 空なら未設定扱い (管理画面で変更可, 既定 UTC)
+      - TIMEZONE=${TIMEZONE:-}
       - TZ=${TIMEZONE:-UTC}
     volumes:
       - ${DATA_DIR:-./data}/archive:/data/archive:ro

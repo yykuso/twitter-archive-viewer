@@ -95,7 +95,7 @@ export const createFeed = <T>(opts: FeedOptions<T>): Feed => {
 };
 
 /** 未取り込み時の空状態 */
-export const noDataBox = (): HTMLElement =>
+export const noDataBox = (adminHref: string): HTMLElement =>
   h('div', { class: 'state state-empty state-nodata' },
     h('p', null, 'まだデータが取り込まれていません'),
-    h('a', { class: 'btn btn-primary', href: '#/admin' }, '取り込み画面へ'));
+    h('a', { class: 'btn btn-primary', href: adminHref }, '取り込み画面へ'));

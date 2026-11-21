@@ -1,10 +1,14 @@
 // サーバーとブラウザで共有する API の型。実行時コードは置かない (型のみ)。
+//
+// 複数アカウント: アカウントごとに別の SQLite (db/accounts/<accountId>.sqlite) と
+// メディア (media/<accountId>/...) を持つ。アカウント単位の API はすべてクエリ `account=<accountId>` を受け付ける。
+// 省略時は既定アカウント (最後に取り込んだアカウント)。存在しない accountId は 404。
 
 export type MediaType = 'photo' | 'video' | 'animated_gif';
 
 export type Media = {
   readonly type: MediaType;
-  /** `/media/...` の URL。ファイルが無い場合は null */
+  /** `/media/<accountId>/...` の URL。ファイルが無い場合は null */
   readonly url: string | null;
   readonly width: number | null;
   readonly height: number | null;
@@ -68,9 +72,22 @@ export type TweetDetail = {
 /** GET /api/calendar : 月ごとの件数 (Meta.timezone 基準) */
 export type MonthCount = { readonly month: string; readonly count: number };
 
-/** GET /api/meta */
+/** GET /api/accounts : 取り込み済みアカウント (最後に取り込んだ順) */
+export type AccountSummary = {
+  readonly id: string;
+  readonly username: string;
+  readonly displayName: string;
+  readonly avatarUrl: string | null;
+  readonly tweetCount: number;
+  /** ISO 8601 */
+  readonly lastImportedAt: string | null;
+  /** ISO 8601 最新アーカイブの生成日時 */
+  readonly archiveGeneratedAt: string | null;
+};
+
+/** GET /api/meta?account= */
 export type Meta = {
-  /** 未取り込みなら null */
+  /** アカウントが 1 つも無ければ null */
   readonly account: { readonly id: string; readonly username: string; readonly displayName: string } | null;
   readonly profile: { readonly bio: string | null; readonly avatarUrl: string | null };
   /** ISO 8601 */
@@ -78,7 +95,7 @@ export type Meta = {
   readonly importedAt: string | null;
   /** 取り込み済みアーカイブ数 */
   readonly importCount: number;
-  /** 表示・日付絞り込み・月別集計に使うタイムゾーン (IANA 名, 環境変数 TIMEZONE) */
+  /** 表示・日付絞り込み・集計に使うタイムゾーン (IANA 名)。Settings.timezone と同じ */
   readonly timezone: string;
   readonly counts: {
     readonly tweets: number;
@@ -125,7 +142,7 @@ export type DmMessage = {
 // ---- 管理 (取り込み) ----
 // POST は Content-Type: application/json と X-Requested-With: fetch ヘッダー必須 (CSRF 対策)
 
-/** GET /api/admin/archives : ARCHIVE_DIR 内の ZIP (新しい順) */
+/** GET /api/admin/archives : ARCHIVE_DIR 内の ZIP (新しい順)。imported は全アカウントの履歴から探す */
 export type ArchiveFile = {
   readonly name: string;
   readonly size: number;
@@ -152,9 +169,11 @@ export type ImportStats = {
   readonly mediaFiles: number;
 };
 
-/** GET /api/admin/imports : 取り込み履歴 (新しい順) */
+/** GET /api/admin/imports?account= : そのアカウントの取り込み履歴 (新しい順) */
 export type ImportRecord = {
   readonly id: number;
+  readonly accountId: string;
+  readonly username: string;
   readonly fileName: string;
   readonly fileSize: number;
   /** ISO 8601 アーカイブ生成日時 */
@@ -170,6 +189,8 @@ export type ImportStage = 'queued' | 'reading' | 'writing' | 'swapping' | 'media
 export type ImportJob = {
   readonly id: string;
   readonly fileName: string;
+  /** ZIP を読んでアカウントが判明するまで null */
+  readonly account: { readonly id: string; readonly username: string } | null;
   readonly stage: ImportStage;
   /** メディア展開などの進捗 */
   readonly progress: { readonly done: number; readonly total: number } | null;
@@ -180,10 +201,62 @@ export type ImportJob = {
   readonly stats: ImportStats | null;
 };
 
-/** POST /api/admin/import → 202 ImportJob / 409 実行中 */
+/** POST /api/admin/import → 202 ImportJob / 409 実行中。取り込み先アカウントは ZIP の manifest から自動判定 (新規なら作成) */
 export type ImportRequest = { readonly fileName: string; readonly skipMedia?: boolean };
 
-/** POST /api/admin/reset → 204 / 409 実行中。DB を空にする (メディアは残す) */
-export type ResetRequest = { readonly confirm: 'RESET' };
+/** POST /api/admin/reset → 204 / 409 実行中 / 404 不明なアカウント。そのアカウントの DB を削除する (メディアは残す) */
+export type ResetRequest = { readonly confirm: 'RESET'; readonly accountId: string };
+
+// ---- 統計 ----
+
+/** GET /api/stats?account= */
+export type StatsSummary = {
+  readonly totals: {
+    readonly tweets: number;
+    readonly original: number;
+    readonly replies: number;
+    readonly retweets: number;
+    /** メディア付きツイート数 */
+    readonly withMedia: number;
+    readonly deleted: number;
+    /** 消失 (最新アーカイブに無い) ツイート数 */
+    readonly removed: number;
+    readonly likes: number;
+    readonly dmConversations: number;
+    readonly dmMessages: number;
+  };
+  /** ISO 8601 */
+  readonly first: string | null;
+  readonly last: string | null;
+  /** ツイートがある年 (設定タイムゾーン基準, 昇順) */
+  readonly years: readonly number[];
+  /** 月別 (設定タイムゾーン基準, 'YYYY-MM' 昇順, 0 件の月も first〜last の範囲で含める) */
+  readonly monthly: readonly MonthlyStats[];
+};
+
+export type MonthlyStats = {
+  readonly month: string;
+  readonly original: number;
+  readonly reply: number;
+  readonly retweet: number;
+};
+
+/** GET /api/stats/daily?account=&year=YYYY : その年の日別件数 (件数 0 の日は含めない) */
+export type DailyCount = { readonly day: string; readonly count: number };
+
+// ---- 設定 ----
+
+/** GET /api/settings */
+export type Settings = {
+  /** 現在有効なタイムゾーン */
+  readonly timezone: string;
+  /** settings: 管理画面で設定 / env: 環境変数 TIMEZONE / default: UTC */
+  readonly timezoneSource: 'settings' | 'env' | 'default';
+  /** 環境変数 TIMEZONE の値 (未設定なら null) */
+  readonly envTimezone: string | null;
+};
+
+/** POST /api/admin/settings → 200 Settings。timezone: null で画面設定を解除 (環境変数/既定に戻す)。不正な IANA 名は 400 */
+export type SettingsRequest = { readonly timezone: string | null };
 
 export type ApiError = { readonly error: string };

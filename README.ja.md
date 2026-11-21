@@ -51,10 +51,26 @@ docker compose --profile tunnel up -d --build
 | --- | --- | --- |
 | `DATA_DIR` | `./data` | `archive/`(ZIP、読み取り専用でマウント)、`db/`(SQLite)、`media/`(展開した画像・動画)を置くホスト側フォルダ |
 | `VIEWER_PORT` | `8080` | ビューアを公開するホスト側ポート。認証がないため LAN 内限定で使うこと |
-| `TIMEZONE` | `UTC` | 日付表示・期間絞り込み・月別カレンダーに使う IANA タイムゾーン |
+| `TIMEZONE` | `UTC` | 日付表示・期間絞り込み・カレンダー・統計に使う IANA タイムゾーン。任意で、管理画面で保存した値(`db/settings.json`)が優先されます |
 | `TUNNEL_TOKEN` | - | Cloudflare Tunnel のトークン。`--profile tunnel` のときのみ必要 |
 
-コンテナ内ではさらに `DB_PATH`・`MEDIA_ROOT`・`ARCHIVE_DIR`・`PORT`・`WEB_ROOT` が使われます。既定値は `/data` と `/app` 配下を指しているため、通常は変更不要です。
+コンテナ内ではさらに `DB_DIR`・`MEDIA_ROOT`・`ARCHIVE_DIR`・`PORT`・`WEB_ROOT` が使われます。既定値は `/data` と `/app` 配下を指しているため、通常は変更不要です。`DB_PATH`(旧・単一 DB のファイル)は移行元の旧 DB を探すためだけに使われます。`DB_DIR` が未設定なら、その親フォルダを `DB_DIR` とみなします。
+
+### データ配置(複数アカウント)
+
+アカウント(アーカイブの manifest にある数値のアカウント ID)ごとに DB とメディアのフォルダが分かれます。ZIP を取り込むと、取り込み先アカウントは自動で決まります。
+
+```
+db/
+  accounts/<accountId>.sqlite   アカウントごとの SQLite
+  settings.json                 管理画面で保存した設定(タイムゾーン)
+media/
+  <accountId>/data/...          そのアカウントの画像・動画
+```
+
+アカウント単位の API は `?account=<accountId>` を受け付けます(省略時は最後に取り込んだアカウント)。メディアの URL は `/media/<accountId>/data/...` です。
+
+以前のバージョンの単一アカウント構成(`db/tweets.sqlite` + `media/data/`)は、起動時に自動で移行されます。DB は `db/accounts/<accountId>.sqlite` へ、`media/data` は `media/<accountId>/data` へ移動します(同じファイルシステム内の rename で、コピーはしません)。移行先の DB が既にある場合は、上書きせずエラーで起動を中止します。
 
 ## アーカイブの取り込みと更新
 
@@ -76,6 +92,16 @@ CLI でも実行できます(サーバーが取り込み中でないときに実
 ```sh
 docker compose run --rm viewer import [zip] [--skip-media]
 ```
+
+## アプリの更新
+
+新しいソースに更新したら、イメージを作り直してください。`docker compose up -d` だけでは古いイメージが使われます。
+
+```sh
+docker compose up -d --build
+```
+
+Synology Container Manager の「構築」も既存のイメージを再利用することがあります。SSH でプロジェクトフォルダに入り `sudo docker compose up -d --build` を実行するか、プロジェクトを停止してコンテナと `twitter-archive-viewer` イメージを削除してから「構築」してください。`DATA_DIR` のデータには影響しません。
 
 ## 安全に公開する
 
@@ -99,7 +125,7 @@ Node.js 22.18 以上と `unzip` が必要です。
 ```sh
 npm install                      # devDependencies のみ(typescript, @types/node)
 npm run build:web
-DB_PATH=./data/db/tweets.sqlite MEDIA_ROOT=./data/media ARCHIVE_DIR=./data/archive npm start
+DB_DIR=./data/db MEDIA_ROOT=./data/media ARCHIVE_DIR=./data/archive npm start
 npm run typecheck
 ```
 

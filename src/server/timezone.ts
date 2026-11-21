@@ -28,6 +28,19 @@ export const assertValidTimeZone = (timeZone: string): void => {
   }
 };
 
+const IANA_SHAPE = /^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)*$/;
+
+/** IANA 名なら正規名 (例 "asia/tokyo" → "Asia/Tokyo")、そうでなければ null。UTC オフセット表記 (+09:00) は受け付けない */
+export const canonicalTimeZone = (timeZone: string): string | null => {
+  if (!IANA_SHAPE.test(timeZone)) return null;
+  try {
+    return new Intl.DateTimeFormat(undefined, { timeZone }).resolvedOptions().timeZone;
+  } catch (e) {
+    if (e instanceof RangeError) return null;
+    throw e;
+  }
+};
+
 type LocalParts = { readonly y: number; readonly mo: number; readonly d: number; readonly h: number; readonly mi: number; readonly s: number };
 
 const localParts = (ms: number, timeZone: string): LocalParts => {

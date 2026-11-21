@@ -1,11 +1,13 @@
-import type { ArchiveFile, ImportJob, ImportRecord, ImportStage, ImportStats, Meta } from '../../src/shared/types.ts';
-import { ApiFailure, fetchArchives, fetchImports, fetchImportStatus, fetchMeta, resetDatabase, startImport } from './api.ts';
+import type { ArchiveFile, ImportJob, ImportRecord, ImportStage, ImportStats, Meta, Settings } from '../../src/shared/types.ts';
+import { ApiFailure, fetchArchives, fetchImports, fetchImportStatus, fetchMeta, fetchSettings, resetDatabase, saveSettings, startImport } from './api.ts';
 import { h, type Child } from './dom.ts';
 import { spinner } from './feed.ts';
-import { formatDateTime, formatDay } from './format.ts';
+import { formatDateTime, formatDay, setDisplayTimeZone } from './format.ts';
 import type { View } from './timeline.ts';
 
 export type AdminProps = {
+  /** 対象アカウント (URL の account)。未指定ならサーバーの既定 */
+  readonly account: string | undefined;
   /** 取り込み完了・リセット後に呼ばれる (ヘッダー等の再取得用) */
   readonly onChanged: () => Promise<void>;
 };
@@ -21,6 +23,11 @@ type State = {
   readonly archives: Load<readonly ArchiveFile[]>;
   readonly history: Load<readonly ImportRecord[]>;
   readonly meta: Meta | null;
+  readonly settings: Load<Settings>;
+  readonly savingTz: boolean;
+  /** 選択中 (未保存) のタイムゾーン。null なら現在の設定値 */
+  readonly tzDraft: string | null;
+  readonly tzFilter: string;
   readonly job: ImportJob | null;
   readonly now: number;
   readonly skipMedia: boolean;
@@ -61,7 +68,7 @@ const loadBox = <T>(l: Load<T>, ok: (v: T) => Node): Node =>
 
 const renderMetaLine = (meta: Meta | null): Node =>
   h('p', { class: 'muted adm-meta' },
-    meta === null ? '' : `取り込み済みアーカイブ: ${meta.importCount} 件 / ツイート ${num(meta.counts.tweets)} / いいね ${num(meta.counts.likes)}`);
+    meta === null ? '' : `${meta.account ? `@${meta.account.username} ・ ` : ''}取り込み済みアーカイブ: ${meta.importCount} 件 / ツイート ${num(meta.counts.tweets)} / いいね ${num(meta.counts.likes)}`);
 
 const renderNotice = (n: Notice | null): Node =>
   n === null ? document.createDocumentFragment()
@@ -89,6 +96,7 @@ const renderJob = (job: ImportJob | null, now: number): Node => {
     h('div', { class: 'adm-job-head' },
       h('span', { class: 'adm-file' }, job.fileName),
       h('span', { class: `badge badge-stage-${job.stage}`, 'data-stage': job.stage }, STAGE_LABELS[job.stage])),
+    h('p', { class: 'muted adm-job-acct' }, job.account ? `取り込み先アカウント: @${job.account.username}` : '取り込み先アカウント: 判定中…'),
     p ? h('div', { class: 'adm-progress' },
         h('div', { class: 'bar', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': p.total, 'aria-valuenow': p.done },
           h('div', { class: 'bar-fill', style: `width:${pct ?? 0}%` })),
@@ -115,7 +123,7 @@ const renderArchives = (list: readonly ArchiveFile[], s: State, act: ArchiveActi
       h('div', { class: 'arch-main' },
         h('div', { class: 'adm-file' }, a.name),
         h('div', { class: 'muted' }, `${gb(a.size)} ・ ${formatDateTime(a.modifiedAt)}`),
-        a.imported ? h('span', { class: 'badge badge-imported' }, `取り込み済み (アーカイブ ${formatDay(a.imported.generatedAt).replaceAll('-', '/')})`) : null),
+        a.imported ? h('span', { class: 'badge badge-imported' }, `取り込み済み (@${a.imported.username} ・ アーカイブ ${formatDay(a.imported.generatedAt)})`) : null),
       h('div', { class: 'arch-act' },
         confirming
           ? [h('span', { class: 'arch-q' }, '本当に取り込む？'),
@@ -125,9 +133,10 @@ const renderArchives = (list: readonly ArchiveFile[], s: State, act: ArchiveActi
   }));
 };
 
-const renderHistory = (list: readonly ImportRecord[]): Node => {
-  if (list.length === 0) return h('p', { class: 'muted' }, '取り込み履歴はまだありません');
-  return h('div', { class: 'tbl-wrap' },
+const renderHistory = (list: readonly ImportRecord[], meta: Meta | null): Node => {
+  const label = h('p', { class: 'muted adm-hist-acct' }, meta?.account ? `対象アカウント: @${meta.account.username} の取り込み履歴` : '取り込み履歴');
+  if (list.length === 0) return h('div', null, label, h('p', { class: 'muted' }, '取り込み履歴はまだありません'));
+  return h('div', null, label, h('div', { class: 'tbl-wrap' },
     h('table', { class: 'tbl adm-history' },
       h('thead', null, h('tr', null, ['完了日時', 'ファイル', 'アーカイブ日', 'ツイート', '消失'].map((t) => h('th', null, t)))),
       h('tbody', null, list.map((r) => {
@@ -138,7 +147,86 @@ const renderHistory = (list: readonly ImportRecord[]): Node => {
           h('td', null, formatDay(r.generatedAt)),
           h('td', null, `追加 ${num(r.stats.tweets.added)} / 更新 ${num(r.stats.tweets.updated)}`),
           h('td', { title: `ツイート ${rm.tweets} / いいね ${rm.likes} / DM ${rm.dmMessages}` }, num(rm.tweets + rm.likes + rm.dmMessages)));
-      }))));
+      })))));
+};
+
+// ---- 表示設定 (タイムゾーン) ----
+
+const SOURCE_LABELS: Readonly<Record<Settings['timezoneSource'], string>> = {
+  settings: '管理画面で設定', env: '環境変数', default: '既定(UTC)',
+};
+
+/** ブラウザが列挙できる IANA タイムゾーン名。未対応なら null (テキスト入力にフォールバック) */
+const supportedZones = (): readonly string[] | null => {
+  if (typeof Intl.supportedValuesOf !== 'function') return null;
+  try {
+    const list = Intl.supportedValuesOf('timeZone');
+    return list.length > 0 ? list : null;
+  } catch (e) {
+    console.warn('[admin] Intl.supportedValuesOf failed', e);
+    return null;
+  }
+};
+
+const zonesWith = (extra: readonly string[]): readonly string[] | null => {
+  const base = supportedZones();
+  return base === null ? null : [...new Set([...base, 'UTC', ...extra])].sort();
+};
+
+type SettingsActions = {
+  readonly picked: (tz: string) => void;
+  readonly filtered: (text: string) => void;
+  readonly save: () => void;
+  readonly reset: () => void;
+};
+
+const renderSettings = (st: Settings, s: State, act: SettingsActions): Node => {
+  const draft = s.tzDraft ?? st.timezone;
+  const zones = zonesWith([st.timezone, ...(st.envTimezone ? [st.envTimezone] : []), draft]);
+  const busy = s.savingTz;
+
+  let field: HTMLInputElement | HTMLSelectElement;
+  let filterRow: Node | null = null;
+  if (zones === null) {
+    const input = h('input', { type: 'text', class: 'tz-input', 'aria-label': 'タイムゾーン (IANA 名)', placeholder: 'Asia/Tokyo', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+    input.value = draft;
+    input.addEventListener('input', () => act.picked(input.value.trim()));
+    field = input;
+  } else {
+    const select = h('select', { class: 'tz-select', 'aria-label': 'タイムゾーン' });
+    const count = h('span', { class: 'muted tz-count' });
+    const fill = (filter: string): void => {
+      const f = filter.trim().toLowerCase();
+      const keep = select.value || draft;
+      const matches = zones.filter((z) => f === '' || z.toLowerCase().includes(f));
+      const list = matches.includes(keep) ? matches : [keep, ...matches];
+      select.replaceChildren(...list.map((z) => h('option', { value: z }, z)));
+      select.value = keep;
+      count.textContent = `${matches.length} 件`;
+    };
+    const filter = h('input', { type: 'search', class: 'tz-filter', 'aria-label': 'タイムゾーンを絞り込み', placeholder: '絞り込み (例: Tokyo)', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+    filter.value = s.tzFilter;
+    select.value = draft;
+    fill(s.tzFilter);
+    filter.addEventListener('input', () => {
+      act.filtered(filter.value);
+      fill(filter.value);
+    });
+    select.addEventListener('change', () => act.picked(select.value));
+    filterRow = h('div', { class: 'tz-row' }, filter, count);
+    field = select;
+  }
+  field.disabled = busy;
+
+  return h('div', { class: 'adm-tz' },
+    h('p', { class: 'adm-tz-now' }, '現在のタイムゾーン: ', h('strong', null, st.timezone), ' ', h('span', { class: 'badge tz-source' }, SOURCE_LABELS[st.timezoneSource])),
+    st.envTimezone !== null ? h('p', { class: 'muted' }, `環境変数 TIMEZONE の値: ${st.envTimezone}`) : null,
+    filterRow,
+    h('div', { class: 'tz-row' }, field),
+    h('div', { class: 'tz-row' },
+      h('button', { type: 'button', class: 'btn btn-primary tz-save', disabled: busy, onclick: act.save }, busy ? '保存中…' : '保存'),
+      h('button', { type: 'button', class: 'btn tz-reset', disabled: busy || st.timezoneSource !== 'settings', onclick: act.reset }, '環境変数/既定に戻す')),
+    h('p', { class: 'muted' }, '日時の表示、期間での絞り込み、統計の集計に使われます。'));
 };
 
 type DangerActions = {
@@ -150,7 +238,9 @@ type DangerActions = {
 
 const renderDanger = (s: State, act: DangerActions): Node => {
   const running = isRunning(s.job);
-  const intro = h('p', { class: 'muted' }, 'DBを空にします。メディアファイルは残ります。再度取り込みが必要です。');
+  const acct = s.meta?.account ?? null;
+  if (acct === null) return h('p', { class: 'muted' }, '対象のアカウントがありません');
+  const intro = h('p', { class: 'muted' }, `このアカウント(@${acct.username})のDBを削除します。メディアは残ります。`);
   if (!s.resetOpen) {
     return h('div', null, intro,
       h('button', { type: 'button', class: 'btn btn-danger', disabled: running || s.resetting, onclick: act.open }, 'データベースを作り直す'));
@@ -179,7 +269,7 @@ export const createAdmin = (props: AdminProps): View => {
   let alive = true;
   let timer: number | undefined;
   let state: State = {
-    archives: { kind: 'loading' }, history: { kind: 'loading' }, meta: null, job: null, now: Date.now(),
+    archives: { kind: 'loading' }, history: { kind: 'loading' }, meta: null, settings: { kind: 'loading' }, savingTz: false, tzDraft: null, tzFilter: '', job: null, now: Date.now(),
     skipMedia: false, pendingFile: null, starting: false, notice: null, resetOpen: false, resetText: '', resetting: false,
   };
 
@@ -195,6 +285,13 @@ export const createAdmin = (props: AdminProps): View => {
     run: () => void runReset(),
   };
 
+  const settingsActions: SettingsActions = {
+    picked: (tz) => { state = { ...state, tzDraft: tz }; },
+    filtered: (text) => { state = { ...state, tzFilter: text }; },
+    save: () => void runSaveTz(state.tzDraft),
+    reset: () => void runSaveTz(null),
+  };
+
   const sect = (cls: string, view: Section['view'], deps: Section['deps']): Section =>
     ({ host: h('div', { class: cls }), view, deps });
 
@@ -207,10 +304,11 @@ export const createAdmin = (props: AdminProps): View => {
     sect('adm-job-host', (s) => renderJob(s.job, s.now), (s) => [s.job, s.now]),
     sect('adm-archives-host', (s) => loadBox(s.archives, (l) => renderArchives(l, s, archiveActions)),
       (s) => [s.archives, s.pendingFile, s.starting, isRunning(s.job)]),
-    sect('adm-history-host', (s) => loadBox(s.history, renderHistory), (s) => [s.history]),
-    sect('adm-danger-host', (s) => renderDanger(s, dangerActions), (s) => [s.resetOpen, s.resetting, isRunning(s.job)]),
+    sect('adm-settings-host', (s) => loadBox(s.settings, (st) => renderSettings(st, s, settingsActions)), (s) => [s.settings, s.savingTz]),
+    sect('adm-history-host', (s) => loadBox(s.history, (l) => renderHistory(l, s.meta)), (s) => [s.history, s.meta]),
+    sect('adm-danger-host', (s) => renderDanger(s, dangerActions), (s) => [s.resetOpen, s.resetting, isRunning(s.job), s.meta]),
   ];
-  const [metaLine, notices, jobHost, archivesHost, historyHost, dangerHost] = sections;
+  const [metaLine, notices, jobHost, archivesHost, settingsHost, historyHost, dangerHost] = sections;
 
   const setState = (patch: Partial<State>): void => {
     if (!alive) return;
@@ -230,8 +328,9 @@ export const createAdmin = (props: AdminProps): View => {
     h('div', { class: 'subhead' }, h('span', null, '管理')),
     h('div', { class: 'adm-body' },
       metaLine?.host,
-      h('p', { class: 'adm-note' }, 'ZIPはデータフォルダの archive/ (コンテナ内では /data/archive) に置いてください。取り込みは既存データに追加・更新され、新しいアーカイブで消えたツイートやいいねも『消失』として残ります。'),
+      h('p', { class: 'adm-note' }, 'ZIPはデータフォルダの archive/ (コンテナ内では /data/archive) に置いてください。取り込みは既存データに追加・更新され、新しいアーカイブで消えたツイートやいいねも『消失』として残ります。ZIPを取り込むと、アーカイブ内のアカウントに自動で振り分けられます（新しいアカウントは自動で追加）'),
       notices?.host,
+      card('表示設定', settingsHost?.host),
       card('取り込みジョブ', jobHost?.host),
       card('アーカイブ一覧', h('label', { class: 'chk adm-skip', for: 'skip-media' }, skip, 'メディア展開をスキップ'), archivesHost?.host),
       card('取り込み履歴', historyHost?.host),
@@ -250,7 +349,7 @@ export const createAdmin = (props: AdminProps): View => {
   };
   const loadHistory = async (): Promise<void> => {
     try {
-      setState({ history: { kind: 'ok', value: await fetchImports() } });
+      setState({ history: { kind: 'ok', value: await fetchImports(props.account) } });
     } catch (e) {
       console.error('[admin] history load failed', e);
       setState({ history: { kind: 'error', message: `取り込み履歴を取得できませんでした: ${messageOf(e)}` } });
@@ -258,10 +357,19 @@ export const createAdmin = (props: AdminProps): View => {
   };
   const loadMeta = async (): Promise<void> => {
     try {
-      setState({ meta: await fetchMeta() });
+      setState({ meta: await fetchMeta(props.account) });
     } catch (e) {
       console.error('[admin] meta load failed', e);
       setState({ notice: { kind: 'error', text: `メタ情報を取得できませんでした: ${messageOf(e)}` } });
+    }
+  };
+
+  const loadSettings = async (): Promise<void> => {
+    try {
+      setState({ settings: { kind: 'ok', value: await fetchSettings() } });
+    } catch (e) {
+      console.error('[admin] settings load failed', e);
+      setState({ settings: { kind: 'error', message: `表示設定を取得できませんでした: ${messageOf(e)}` } });
     }
   };
 
@@ -316,12 +424,33 @@ export const createAdmin = (props: AdminProps): View => {
     }
   };
 
+  /** timezone: null で画面設定を解除 (環境変数/既定に戻す)。保存後に日付表示を新しいタイムゾーンで描き直す */
+  const runSaveTz = async (timezone: string | null): Promise<void> => {
+    if (timezone !== null && timezone === '') {
+      setState({ notice: { kind: 'error', text: 'タイムゾーンを入力してください' } });
+      return;
+    }
+    setState({ savingTz: true, notice: null });
+    try {
+      const saved = await saveSettings(timezone);
+      setDisplayTimeZone(saved.timezone);
+      // 保持中のビューを破棄してから完了を表示する (古い表示タイムゾーンのまま戻れないように)
+      await props.onChanged();
+      setState({ settings: { kind: 'ok', value: saved }, savingTz: false, tzDraft: null, notice: { kind: 'info', text: `タイムゾーンを ${saved.timezone} にしました` } });
+      await Promise.all([loadArchives(), loadHistory(), loadMeta()]);
+    } catch (e) {
+      console.error('[admin] settings save failed', e);
+      setState({ savingTz: false, notice: { kind: 'error', text: `設定を保存できませんでした: ${messageOf(e)}` } });
+    }
+  };
+
   const runReset = async (): Promise<void> => {
-    if (state.resetText !== 'RESET') return;
+    const target = state.meta?.account ?? null;
+    if (state.resetText !== 'RESET' || target === null) return;
     setState({ resetting: true, notice: null });
     try {
-      await resetDatabase();
-      setState({ resetting: false, resetOpen: false, resetText: '', job: null, notice: { kind: 'info', text: 'データベースを作り直しました。再度取り込みを行ってください。' } });
+      await resetDatabase(target.id);
+      setState({ resetting: false, resetOpen: false, resetText: '', job: null, notice: { kind: 'info', text: `@${target.username} のデータベースを作り直しました。再度取り込みを行ってください。` } });
       await refreshAll();
     } catch (e) {
       const conflict = e instanceof ApiFailure && e.status === 409;
@@ -335,6 +464,7 @@ export const createAdmin = (props: AdminProps): View => {
   void loadArchives();
   void loadHistory();
   void loadMeta();
+  void loadSettings();
   void poll();
 
   return {

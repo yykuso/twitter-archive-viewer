@@ -51,10 +51,26 @@ Set these in `.env` (see `.env.example`) or the environment.
 | --- | --- | --- |
 | `DATA_DIR` | `./data` | Host folder holding `archive/` (ZIPs, mounted read-only), `db/` (SQLite) and `media/` (extracted images/videos) |
 | `VIEWER_PORT` | `8080` | Host port that publishes the viewer. It has no authentication: keep it LAN-only |
-| `TIMEZONE` | `UTC` | IANA time zone used for date display, date filters and the monthly calendar |
+| `TIMEZONE` | `UTC` | IANA time zone used for date display, date filters, the calendar and stats. Optional: a time zone saved from the admin screen (stored in `db/settings.json`) takes precedence over it |
 | `TUNNEL_TOKEN` | - | Cloudflare Tunnel token. Only needed with `--profile tunnel` |
 
-Inside the container the server also reads `DB_PATH`, `MEDIA_ROOT`, `ARCHIVE_DIR`, `PORT` and `WEB_ROOT`. Their defaults point under `/data` and `/app`, so you normally do not change them.
+Inside the container the server also reads `DB_DIR`, `MEDIA_ROOT`, `ARCHIVE_DIR`, `PORT` and `WEB_ROOT`. Their defaults point under `/data` and `/app`, so you normally do not change them. `DB_PATH` (the old single-DB file) is only used to find a legacy database to migrate; if `DB_DIR` is unset, its parent folder is used as `DB_DIR`.
+
+### Data layout (multiple accounts)
+
+Each account (identified by the numeric account ID in the archive's manifest) has its own database and media folder, and the account is chosen automatically when you import a ZIP:
+
+```
+db/
+  accounts/<accountId>.sqlite   one SQLite per account
+  settings.json                 settings saved from the admin screen (time zone)
+media/
+  <accountId>/data/...          extracted images/videos of that account
+```
+
+API endpoints that are per account accept `?account=<accountId>` (default: the most recently imported account). Media URLs are `/media/<accountId>/data/...`.
+
+A single-account install from an earlier version (`db/tweets.sqlite` + `media/data/`) is migrated automatically at startup: the DB moves to `db/accounts/<accountId>.sqlite` and `media/data` to `media/<accountId>/data` (a same-filesystem rename; nothing is copied). If the target DB already exists, startup stops with an error rather than overwriting it.
 
 ## Importing and updating archives
 
@@ -76,6 +92,16 @@ CLI alternative (do not run it while the server is importing):
 ```sh
 docker compose run --rm viewer import [zip] [--skip-media]
 ```
+
+## Updating the app
+
+After pulling new source, rebuild the image — `docker compose up -d` alone reuses the old image:
+
+```sh
+docker compose up -d --build
+```
+
+On Synology Container Manager, the project's "Build" action may also reuse the existing image. Either run the command above over SSH (`sudo docker compose up -d --build` in the project folder), or stop the project, delete its containers and the `twitter-archive-viewer` image, then Build again. Your data in `DATA_DIR` is not affected.
 
 ## Exposing it safely
 
@@ -99,7 +125,7 @@ Requires Node.js >= 22.18 and `unzip`.
 ```sh
 npm install                      # dev dependencies only (typescript, @types/node)
 npm run build:web
-DB_PATH=./data/db/tweets.sqlite MEDIA_ROOT=./data/media ARCHIVE_DIR=./data/archive npm start
+DB_DIR=./data/db MEDIA_ROOT=./data/media ARCHIVE_DIR=./data/archive npm start
 npm run typecheck
 ```
 

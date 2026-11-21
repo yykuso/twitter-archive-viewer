@@ -13,26 +13,41 @@ const appendChildren = (parent: Node, children: readonly Child[]): void => {
   }
 };
 
+const applyAttrs = (el: Element, attrs: Attrs | null): void => {
+  if (!attrs) return;
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === null || value === undefined || value === false) continue;
+    if (typeof value === 'function') {
+      el.addEventListener(key.startsWith('on') ? key.slice(2) : key, value);
+    } else if (value === true) {
+      el.setAttribute(key, '');
+    } else {
+      el.setAttribute(key, String(value));
+    }
+  }
+};
+
 export const h = <K extends keyof HTMLElementTagNameMap>(
   tag: K,
   attrs: Attrs | null = null,
   ...children: Child[]
 ): HTMLElementTagNameMap[K] => {
   const el = document.createElement(tag);
-  if (attrs) {
-    for (const [key, value] of Object.entries(attrs)) {
-      if (value === null || value === undefined || value === false) continue;
-      if (typeof value === 'function') {
-        el.addEventListener(key.startsWith('on') ? key.slice(2) : key, value);
-      } else if (key === 'class') {
-        el.className = String(value);
-      } else if (value === true) {
-        el.setAttribute(key, '');
-      } else {
-        el.setAttribute(key, String(value));
-      }
-    }
-  }
+  applyAttrs(el, attrs);
+  appendChildren(el, children);
+  return el;
+};
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** SVG 要素版の h()。属性は setAttribute、子は Text ノード経由 */
+export const sv = <K extends keyof SVGElementTagNameMap>(
+  tag: K,
+  attrs: Attrs | null = null,
+  ...children: Child[]
+): SVGElementTagNameMap[K] => {
+  const el = document.createElementNS(SVG_NS, tag);
+  applyAttrs(el, attrs);
   appendChildren(el, children);
   return el;
 };

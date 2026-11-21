@@ -16,11 +16,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production \
-    DB_PATH=/data/db/tweets.sqlite \
+    DB_DIR=/data/db \
     MEDIA_ROOT=/data/media \
     ARCHIVE_DIR=/data/archive \
     WEB_ROOT=/app/web/dist \
-    TIMEZONE=UTC \
     PORT=8080
 COPY package.json ./
 COPY src ./src

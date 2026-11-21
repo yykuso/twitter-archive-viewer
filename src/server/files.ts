@@ -80,6 +80,13 @@ export const locateFile = async (root: string, candidate: string): Promise<Locat
   }
 };
 
+/** If-Modified-Since 以降に更新が無ければ true (HTTP 日付は秒精度なので秒で比較) */
+const notModifiedSince = (header: string | undefined, mtime: Date): boolean => {
+  if (header === undefined) return false;
+  const since = Date.parse(header);
+  return !Number.isNaN(since) && Math.floor(mtime.getTime() / 1000) <= Math.floor(since / 1000);
+};
+
 export const sendFile = (
   req: IncomingMessage,
   res: ServerResponse,
@@ -92,6 +99,12 @@ export const sendFile = (
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Cache-Control', cacheControl);
   res.setHeader('Last-Modified', file.stats.mtime.toUTCString());
+
+  if (range.kind !== 'range' && notModifiedSince(req.headers['if-modified-since'], file.stats.mtime)) {
+    res.writeHead(304);
+    res.end();
+    return;
+  }
 
   if (range.kind === 'unsatisfiable') {
     res.setHeader('Content-Range', `bytes */${size}`);

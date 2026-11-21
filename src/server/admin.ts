@@ -6,29 +6,29 @@ import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { closeAsSingleFile, createEmptyDb, openDb } from '../db/open.ts';
+import { closeAsSingleFile, openDb } from '../db/open.ts';
+import { accountDbPath, accountMediaDir, isAccountId } from '../db/paths.ts';
 import { removeDbFiles, swapDatabase, tmpPathFor } from '../db/swap.ts';
 import { countMediaEntries, mediaPatterns } from '../import/media.ts';
 import { setImportMediaFiles } from '../import/merge.ts';
 import { extractMedia, isExtractedLine, listEntries } from '../import/zip.ts';
 import type { ArchiveFile, ImportJob, ImportRecord, ImportRequest, ImportStage, ImportStats, ResetRequest } from '../shared/types.ts';
-import type { DbHolder } from './db-holder.ts';
 import { HttpError } from './http.ts';
-import type { Queries } from './queries.ts';
+import type { Registry } from './registry.ts';
 
 const CLI_PATH = fileURLToPath(new URL('../import/cli.ts', import.meta.url));
 const STDERR_KEEP = 30;
 
 export type AdminDeps = {
-  readonly holder: DbHolder;
-  readonly queries: Queries;
+  readonly registry: Registry;
+  /** `<dbDir>` (アカウント別 DB は `<dbDir>/accounts/<id>.sqlite`) */
+  readonly dbDir: string;
   readonly archiveDir: string;
   readonly mediaRoot: string;
 };
 
 export type Admin = {
   readonly archives: () => Promise<ArchiveFile[]>;
-  readonly imports: () => ImportRecord[];
   readonly status: () => ImportJob | null;
   readonly startImport: (body: unknown) => ImportJob;
   readonly reset: (body: unknown) => void;
@@ -65,8 +65,11 @@ export const parseImportRequest = (body: unknown): ImportRequest => {
 };
 
 export const parseResetRequest = (body: unknown): ResetRequest => {
-  if (asRecord(body)['confirm'] !== 'RESET') throw new HttpError(400, 'confirm must be "RESET"');
-  return { confirm: 'RESET' };
+  const o = asRecord(body);
+  if (o['confirm'] !== 'RESET') throw new HttpError(400, 'confirm must be "RESET"');
+  const accountId = o['accountId'];
+  if (typeof accountId !== 'string' || !isAccountId(accountId)) throw new HttpError(400, 'accountId must be a numeric account id');
+  return { confirm: 'RESET', accountId };
 };
 
 // ---- ジョブ状態 (pure) ---------------------------------------------------------
@@ -76,6 +79,7 @@ const isRunning = (job: ImportJob | null): boolean => job !== null && job.stage 
 const newJob = (fileName: string): ImportJob => ({
   id: randomUUID(),
   fileName,
+  account: null,
   stage: 'queued',
   progress: null,
   message: null,
@@ -89,8 +93,13 @@ const errorText = (e: unknown): string => (e instanceof Error ? e.message : Stri
 
 /** 子プロセスの stdout の 1 行 (JSON 行) の解釈結果 */
 type CliEvent =
-  | { readonly kind: 'stage'; readonly stage: 'reading' | 'writing'; readonly message: string }
-  | { readonly kind: 'built'; readonly importId: number; readonly stats: ImportStats }
+  | {
+      readonly kind: 'stage';
+      readonly stage: 'reading' | 'writing';
+      readonly message: string | null;
+      readonly account: { readonly id: string; readonly username: string } | null;
+    }
+  | { readonly kind: 'built'; readonly accountId: string; readonly importId: number; readonly stats: ImportStats }
   | { readonly kind: 'other' };
 
 export const parseCliLine = (line: string): CliEvent => {
@@ -102,11 +111,23 @@ export const parseCliLine = (line: string): CliEvent => {
   }
   if (typeof v !== 'object' || v === null) return { kind: 'other' };
   const o = v as Record<string, unknown>;
-  if ((o['stage'] === 'reading' || o['stage'] === 'writing') && typeof o['message'] === 'string') {
-    return { kind: 'stage', stage: o['stage'], message: o['message'] };
+  if (o['stage'] === 'reading' || o['stage'] === 'writing') {
+    const acc = o['account'];
+    const account =
+      typeof acc === 'object' && acc !== null && typeof (acc as Record<string, unknown>)['id'] === 'string' && typeof (acc as Record<string, unknown>)['username'] === 'string'
+        ? { id: (acc as { id: string }).id, username: (acc as { username: string }).username }
+        : null;
+    const message = typeof o['message'] === 'string' ? o['message'] : null;
+    if (message !== null || account !== null) return { kind: 'stage', stage: o['stage'], message, account };
   }
-  if (o['stage'] === 'built' && typeof o['importId'] === 'number' && typeof o['stats'] === 'object' && o['stats'] !== null) {
-    return { kind: 'built', importId: o['importId'], stats: o['stats'] as ImportStats };
+  if (
+    o['stage'] === 'built' &&
+    typeof o['accountId'] === 'string' &&
+    typeof o['importId'] === 'number' &&
+    typeof o['stats'] === 'object' &&
+    o['stats'] !== null
+  ) {
+    return { kind: 'built', accountId: o['accountId'], importId: o['importId'], stats: o['stats'] as ImportStats };
   }
   return { kind: 'other' };
 };
@@ -114,9 +135,7 @@ export const parseCliLine = (line: string): CliEvent => {
 // ---- 本体 ----------------------------------------------------------------------
 
 export const createAdmin = (deps: AdminDeps): Admin => {
-  const { holder, queries, archiveDir, mediaRoot } = deps;
-  const dbPath = holder.path;
-  const tmpPath = tmpPathFor(dbPath);
+  const { registry, dbDir, archiveDir, mediaRoot } = deps;
   let job: ImportJob | null = null;
   let child: ChildProcess | null = null;
 
@@ -126,31 +145,23 @@ export const createAdmin = (deps: AdminDeps): Admin => {
   const setStage = (id: string, stage: ImportStage, message: string | null, progress: ImportJob['progress'] = null): void =>
     patch(id, { stage, message, progress });
 
-  /** ライブ DB を閉じて fn を実行し、成否に関わらず開き直す (全部同期なので他のリクエストは割り込まない) */
-  const withHolderClosed = <T>(fn: () => T): T => {
-    holder.close();
-    try {
-      return fn();
-    } finally {
-      holder.reopen();
-    }
-  };
-
   /** import 子プロセスを実行し、built イベントを返す */
-  const runCli = (j: ImportJob, zipPath: string): Promise<{ importId: number; stats: ImportStats }> =>
+  const runCli = (j: ImportJob, zipPath: string): Promise<{ accountId: string; importId: number; stats: ImportStats }> =>
     new Promise((resolve, reject) => {
       const proc = spawn(
         process.execPath,
-        ['--disable-warning=ExperimentalWarning', CLI_PATH, zipPath, '--out', tmpPath, '--progress-json'],
+        ['--disable-warning=ExperimentalWarning', CLI_PATH, zipPath, '--build-only', '--progress-json'],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
       child = proc;
       const errLines: string[] = [];
-      let built: { importId: number; stats: ImportStats } | null = null;
+      let built: { accountId: string; importId: number; stats: ImportStats } | null = null;
       createInterface({ input: proc.stdout }).on('line', (line) => {
         const ev = parseCliLine(line);
-        if (ev.kind === 'stage') setStage(j.id, ev.stage, ev.message);
-        else if (ev.kind === 'built') built = { importId: ev.importId, stats: ev.stats };
+        if (ev.kind === 'stage') {
+          if (ev.account !== null) patch(j.id, { account: ev.account });
+          if (ev.message !== null) setStage(j.id, ev.stage, ev.message);
+        } else if (ev.kind === 'built') built = { accountId: ev.accountId, importId: ev.importId, stats: ev.stats };
       });
       createInterface({ input: proc.stderr }).on('line', (line) => {
         if (line.trim() === '') return;
@@ -173,12 +184,12 @@ export const createAdmin = (deps: AdminDeps): Admin => {
       });
     });
 
-  const extractMediaWithProgress = async (j: ImportJob, zipPath: string): Promise<number> => {
+  const extractMediaWithProgress = async (j: ImportJob, zipPath: string, accountId: string): Promise<number> => {
     const entries = await listEntries(zipPath);
     const total = countMediaEntries(entries);
     setStage(j.id, 'media', 'メディアを展開中', { done: 0, total });
     let done = 0;
-    const extracted = await extractMedia(zipPath, mediaPatterns(entries), mediaRoot, (line) => {
+    const extracted = await extractMedia(zipPath, mediaPatterns(entries), accountMediaDir(mediaRoot, accountId), (line) => {
       if (!isExtractedLine(line) || !line.includes('data/')) return;
       done += 1;
       patch(j.id, { progress: { done: Math.min(done, total), total } });
@@ -189,18 +200,24 @@ export const createAdmin = (deps: AdminDeps): Admin => {
 
   const run = async (j: ImportJob, req: ImportRequest): Promise<void> => {
     const zipPath = join(archiveDir, req.fileName);
+    let tmpPath: string | null = null;
     try {
-      removeDbFiles(tmpPath);
       setStage(j.id, 'reading', 'ZIP を読み込み中');
       const built = await runCli(j, zipPath);
+      const id = built.accountId;
+      if (!isAccountId(id)) throw new Error(`取り込みプロセスが不正なアカウント ID を返しました: ${JSON.stringify(id)}`);
+      const dbPath = accountDbPath(dbDir, id);
+      const tmp = tmpPathFor(dbPath);
+      tmpPath = tmp;
 
       setStage(j.id, 'swapping', 'DB を差し替え中');
-      withHolderClosed(() => swapDatabase(dbPath, tmpPath));
+      registry.withClosed(id, () => swapDatabase(dbPath, tmp));
+      tmpPath = null;
       patch(j.id, { stats: built.stats });
 
       if (req.skipMedia !== true) {
-        const mediaFiles = await extractMediaWithProgress(j, zipPath);
-        const stats = withHolderClosed(() => {
+        const mediaFiles = await extractMediaWithProgress(j, zipPath, id);
+        const stats = registry.withClosed(id, () => {
           const db = openDb(dbPath);
           try {
             return setImportMediaFiles(db, built.importId, mediaFiles);
@@ -212,11 +229,23 @@ export const createAdmin = (deps: AdminDeps): Admin => {
       }
       patch(j.id, { stage: 'done', message: null, finishedAt: new Date().toISOString() });
     } catch (e) {
-      removeDbFiles(tmpPath);
+      const known = job?.id === j.id ? job.account : null;
+      const stale = tmpPath ?? (known === null ? null : tmpPathFor(accountDbPath(dbDir, known.id)));
+      if (stale !== null) removeDbFiles(stale);
       console.error(`[admin] import failed (${req.fileName}): ${errorText(e)}`);
       patch(j.id, { stage: 'failed', error: errorText(e), finishedAt: new Date().toISOString() });
     }
   };
+
+  /** 全アカウントの履歴から、同名・同サイズの ZIP の最新の取り込み記録 */
+  const latestImportAcrossAccounts = (name: string, size: number): ImportRecord | null =>
+    registry
+      .handles()
+      .flatMap((h) => {
+        const r = h.queries.latestImportOf(name, size);
+        return r === null ? [] : [r];
+      })
+      .reduce<ImportRecord | null>((best, r) => (best === null || Date.parse(r.finishedAt) > Date.parse(best.finishedAt) ? r : best), null);
 
   const archives = async (): Promise<ArchiveFile[]> => {
     let names: string[];
@@ -234,7 +263,7 @@ export const createAdmin = (deps: AdminDeps): Admin => {
         name,
         size: st.size,
         modifiedAt: st.mtime.toISOString(),
-        imported: queries.latestImportOf(name, st.size),
+        imported: latestImportAcrossAccounts(name, st.size),
       }));
   };
 
@@ -250,28 +279,22 @@ export const createAdmin = (deps: AdminDeps): Admin => {
   };
 
   const reset = (body: unknown): void => {
-    parseResetRequest(body);
+    const { accountId } = parseResetRequest(body);
     if (isRunning(job)) throw new HttpError(409, 'an import is running');
-    holder.close();
-    try {
-      removeDbFiles(dbPath);
-      removeDbFiles(tmpPath);
-      createEmptyDb(dbPath);
-    } finally {
-      holder.reopen();
-    }
-    console.log('[admin] database reset');
+    if (!registry.has(accountId)) throw new HttpError(404, 'account not found');
+    registry.remove(accountId);
+    console.log(`[admin] database reset: account ${accountId}`);
   };
 
   return {
     archives,
-    imports: () => queries.imports(),
     status: () => job,
     startImport,
     reset,
     abort: () => {
       child?.kill('SIGTERM');
-      removeDbFiles(tmpPath);
+      const known = job?.account ?? null;
+      if (known !== null && isAccountId(known.id)) removeDbFiles(tmpPathFor(accountDbPath(dbDir, known.id)));
     },
   };
 };

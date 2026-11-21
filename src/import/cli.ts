@@ -1,7 +1,9 @@
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { migrateLegacyLayout } from '../db/legacy.ts';
 import { closeAsSingleFile, config, openDb } from '../db/open.ts';
+import { accountDbPath, accountMediaDir, assertAccountId } from '../db/paths.ts';
 import { swapDatabase, tmpPathFor } from '../db/swap.ts';
 import type { ImportStats } from '../shared/types.ts';
 import { buildMergedDb } from './build.ts';
@@ -22,33 +24,30 @@ import { extractMedia, listEntries, readEntryText } from './zip.ts';
 type Args = {
   readonly zip: string;
   readonly skipMedia: boolean;
-  readonly out: string | null;
+  /** true なら DB を tmp に作るだけで止める (差し替えとメディア展開は呼び出し元 = サーバーが行う) */
+  readonly buildOnly: boolean;
   readonly progressJson: boolean;
 };
 
-const USAGE = '使い方: cli.ts <archive.zip> [--skip-media] [--out <tmpPath>] [--progress-json]';
+const USAGE = '使い方: cli.ts <archive.zip> [--skip-media] [--build-only] [--progress-json]';
 
 const parseArgs = (argv: readonly string[]): Args => {
   const positional: string[] = [];
   let skipMedia = false;
   let progressJson = false;
-  let out: string | null = null;
+  let buildOnly = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] ?? '';
     if (a === '--skip-media') skipMedia = true;
     else if (a === '--progress-json') progressJson = true;
-    else if (a === '--out') {
-      const v = argv[i + 1];
-      if (v === undefined || v.startsWith('--')) throw new Error(`--out にはパスが必要です\n${USAGE}`);
-      out = v;
-      i += 1;
-    } else if (a.startsWith('--')) throw new Error(`不明なオプション: ${a}\n${USAGE}`);
+    else if (a === '--build-only') buildOnly = true;
+    else if (a.startsWith('--')) throw new Error(`不明なオプション: ${a}\n${USAGE}`);
     else positional.push(a);
   }
   const [zip, ...rest] = positional;
   if (zip === undefined || rest.length > 0) throw new Error(USAGE);
   if (!existsSync(zip) || !statSync(zip).isFile()) throw new Error(`ZIP ファイルが見つかりません: ${zip}`);
-  return { zip, skipMedia, out, progressJson };
+  return { zip, skipMedia, buildOnly, progressJson };
 };
 
 const secs = (since: number): string => `${((performance.now() - since) / 1000).toFixed(1)}s`;
@@ -74,10 +73,11 @@ const main = async (): Promise<void> => {
   };
   const t0 = performance.now();
   const startedAt = Date.now();
-  const standalone = args.out === null;
-  const tmpPath = args.out ?? tmpPathFor(config.dbPath);
+  const standalone = !args.buildOnly;
 
   if (standalone) {
+    // サーバー経由なら起動時に移行済み。スタンドアロンでは旧レイアウトが残っていればここで移行する (冪等)
+    migrateLegacyLayout({ legacyDbPath: config.legacyDbPath, dbDir: config.dbDir, mediaRoot: config.mediaRoot });
     log('警告: スタンドアロン取り込みです。サーバーが起動中、または別の取り込みを実行中でないことを確認してください');
   }
 
@@ -88,6 +88,12 @@ const main = async (): Promise<void> => {
   const index = buildMediaIndex(entries, MEDIA_DIRS);
 
   const manifest = parseManifest(parseJsAssignment(await readEntryText(zip, 'data/manifest.js'), 'data/manifest.js'));
+  const accountId = assertAccountId(manifest.accountId);
+  const dbPath = accountDbPath(config.dbDir, accountId);
+  const tmpPath = tmpPathFor(dbPath);
+  const mediaDir = accountMediaDir(config.mediaRoot, accountId);
+  log(`アカウント: @${manifest.userName} (${accountId}) → ${dbPath}`);
+  emit({ stage: 'reading', account: { id: accountId, username: manifest.userName } });
   const generatedAt = generationMs(manifest.generationDate);
   log(`アーカイブ生成日時: ${new Date(generatedAt).toISOString()}`);
   const [rawTweets, rawDeleted, rawLikes, rawDms, rawGroupDms, profile] = await Promise.all([
@@ -121,7 +127,7 @@ const main = async (): Promise<void> => {
 
   emit({ stage: 'writing', message: 'DB にマージ中' });
   const tWrite = performance.now();
-  const { importId, stats } = buildMergedDb(config.dbPath, tmpPath, {
+  const { importId, stats } = buildMergedDb(dbPath, tmpPath, {
     data,
     generatedAt,
     fileName: basename(zip),
@@ -146,12 +152,12 @@ const main = async (): Promise<void> => {
 
   if (!standalone) {
     // サーバー用: 差し替えとメディア展開は呼び出し側が行う
-    emit({ stage: 'built', generatedAt, importId, stats });
+    emit({ stage: 'built', accountId, generatedAt, importId, stats });
     return;
   }
 
-  swapDatabase(config.dbPath, tmpPath);
-  log(`DB を差し替えました: ${config.dbPath}`);
+  swapDatabase(dbPath, tmpPath);
+  log(`DB を差し替えました: ${dbPath}`);
 
   let mediaFiles = 0;
   if (skipMedia) {
@@ -159,17 +165,17 @@ const main = async (): Promise<void> => {
   } else {
     const patterns = mediaPatterns(entries);
     const tMedia = performance.now();
-    log(`メディア展開開始 → ${config.mediaRoot} (${patterns.length} ディレクトリ, ${countMediaEntries(entries)} ファイル)`);
-    mediaFiles = await extractMedia(zip, patterns, config.mediaRoot);
+    log(`メディア展開開始 → ${mediaDir} (${patterns.length} ディレクトリ, ${countMediaEntries(entries)} ファイル)`);
+    mediaFiles = await extractMedia(zip, patterns, mediaDir);
     log(`メディア展開完了 (${secs(tMedia)}): 新規 ${mediaFiles} ファイル`);
-    const db = openDb(config.dbPath);
+    const db = openDb(dbPath);
     try {
       setImportMediaFiles(db, importId, mediaFiles);
     } finally {
       closeAsSingleFile(db);
     }
   }
-  const db = openDb(config.dbPath, { readOnly: true });
+  const db = openDb(dbPath, { readOnly: true });
   try {
     for (const [table, n] of Object.entries(countRows(db))) log(`  ${table}: ${n}`);
   } finally {

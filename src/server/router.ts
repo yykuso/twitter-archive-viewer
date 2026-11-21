@@ -1,21 +1,25 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { join } from 'node:path';
+import { isAccountId } from '../db/paths.ts';
 import { HttpError, isReadMethod, readJsonBody, sendError, sendJson, sendMethodNotAllowed, sendText } from './http.ts';
+import type { SettingsRequest } from '../shared/types.ts';
 import type { Admin } from './admin.ts';
 import { locateFile, resolveUnder, sendFile, type Located } from './files.ts';
-import { parseKeysetCursor, parseLimit, parseOrdCursor, parseTerms, parseTweetFilter } from './params.ts';
-import type { Queries } from './queries.ts';
+import { parseKeysetCursor, parseLimit, parseOrdCursor, parseTerms, parseTweetFilter, parseYear } from './params.ts';
+import type { Registry } from './registry.ts';
+import type { SettingsStore } from './settings.ts';
 
 export type Deps = {
-  readonly queries: Queries;
+  readonly registry: Registry;
+  readonly settings: SettingsStore;
   readonly admin: Admin;
   readonly mediaRoot: string;
-  readonly timeZone: string;
   readonly webRoot: string;
 };
 
 const MEDIA_CACHE = 'public, max-age=31536000, immutable';
-const STATIC_CACHE = 'public, max-age=3600';
+// 更新後に古い JS/CSS が残らないよう毎回再検証する (未変更なら 304)
+const STATIC_CACHE = 'no-cache';
 const INDEX_CACHE = 'no-cache';
 const ID_RE = /^[0-9A-Za-z_-]{1,64}$/;
 
@@ -27,23 +31,36 @@ const decodePath = (raw: string): string => {
   }
 };
 
-const POST_ROUTES: ReadonlySet<string> = new Set(['/api/admin/import', '/api/admin/reset']);
+const POST_ROUTES: ReadonlySet<string> = new Set(['/api/admin/import', '/api/admin/reset', '/api/admin/settings']);
+
+const parseSettingsRequest = (body: unknown): SettingsRequest => {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new HttpError(400, 'request body must be a JSON object');
+  const tz = (body as Record<string, unknown>)['timezone'];
+  if (tz !== null && typeof tz !== 'string') throw new HttpError(400, 'timezone must be a string or null');
+  return { timezone: tz };
+};
 
 const handlePost = async (deps: Deps, pathname: string, req: IncomingMessage, res: ServerResponse): Promise<void> => {
   const body = await readJsonBody(req, res);
   if (pathname === '/api/admin/import') return sendJson(res, 202, deps.admin.startImport(body));
+  if (pathname === '/api/admin/settings') return sendJson(res, 200, deps.settings.set(parseSettingsRequest(body).timezone));
   deps.admin.reset(body);
   res.writeHead(204, { 'Cache-Control': 'no-store' });
   res.end();
 };
 
 const handleApi = async (deps: Deps, pathname: string, sp: URLSearchParams, res: ServerResponse): Promise<void> => {
-  const q = deps.queries;
   if (pathname === '/api/admin/archives') return sendJson(res, 200, await deps.admin.archives());
-  if (pathname === '/api/admin/imports') return sendJson(res, 200, deps.admin.imports());
   if (pathname === '/api/admin/import/status') return sendJson(res, 200, deps.admin.status());
+  if (pathname === '/api/accounts') return sendJson(res, 200, deps.registry.list());
+  if (pathname === '/api/settings') return sendJson(res, 200, deps.settings.get());
+  // ここから先はアカウント単位 (?account= 省略時は既定アカウント)
+  const q = deps.registry.resolve(sp.get('account')).queries;
+  if (pathname === '/api/admin/imports') return sendJson(res, 200, q.imports());
   if (pathname === '/api/meta') return sendJson(res, 200, q.meta());
-  if (pathname === '/api/tweets') return sendJson(res, 200, q.tweets(parseTweetFilter(sp, deps.timeZone)));
+  if (pathname === '/api/stats') return sendJson(res, 200, q.stats());
+  if (pathname === '/api/stats/daily') return sendJson(res, 200, q.dailyCounts(parseYear(sp.get('year'))));
+  if (pathname === '/api/tweets') return sendJson(res, 200, q.tweets(parseTweetFilter(sp, deps.settings.timeZone())));
   if (pathname === '/api/calendar') return sendJson(res, 200, q.calendar());
   if (pathname === '/api/dm') return sendJson(res, 200, q.dmConversations());
   if (pathname === '/api/likes') {
@@ -67,6 +84,8 @@ const handleApi = async (deps: Deps, pathname: string, sp: URLSearchParams, res:
 
 const serveMedia = async (deps: Deps, pathname: string, req: IncomingMessage, res: ServerResponse): Promise<void> => {
   const rel = decodePath(pathname.slice('/media/'.length));
+  // 先頭セグメントはアカウント ID (`/media/<accountId>/data/...`)
+  if (!isAccountId(rel.split('/')[0] ?? '')) return sendError(res, 400, 'invalid media path');
   const candidate = resolveUnder(deps.mediaRoot, rel);
   if (candidate === null || rel === '') return sendError(res, 400, 'invalid media path');
   const file = await locateFile(deps.mediaRoot, candidate);
