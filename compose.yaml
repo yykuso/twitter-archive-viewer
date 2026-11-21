@@ -1,0 +1,51 @@
+name: twitter-archive
+
+# Quick start / 使い方
+#   1. Create the data folders first (Synology / NAS: Docker does not create bind-mount dirs for you):
+#        mkdir -p ${DATA_DIR:-./data}/archive ${DATA_DIR:-./data}/db ${DATA_DIR:-./data}/media
+#      先にデータフォルダを作成してください (Synology など、bind マウント先を自動作成しない環境向け)。
+#   2. Put your Twitter/X archive ZIP(s) into ${DATA_DIR}/archive.
+#      Twitter/X のアーカイブ ZIP を ${DATA_DIR}/archive に置きます。
+#   3. Start: docker compose up -d --build   then open http://localhost:${VIEWER_PORT:-8080}/ and import from the admin page.
+#      起動後、ブラウザで開き、管理画面から取り込みます。
+#   4. To also run the optional Cloudflare Tunnel: docker compose --profile tunnel up -d --build
+#      (set TUNNEL_TOKEN in .env first). トンネル (cloudflared) も使う場合は --profile tunnel を付け、.env に TUNNEL_TOKEN を設定します。
+#
+# Settings come from a .env file next to this file (see .env.example) / 設定は .env で行います:
+#   DATA_DIR (default ./data), VIEWER_PORT (default 8080), TIMEZONE (default UTC), TUNNEL_TOKEN (tunnel profile only)
+
+services:
+  viewer:
+    build: .
+    image: twitter-archive-viewer:latest
+    container_name: twitter-archive-viewer
+    restart: unless-stopped
+    environment:
+      - TIMEZONE=${TIMEZONE:-UTC}
+      - TZ=${TIMEZONE:-UTC}
+    volumes:
+      - ${DATA_DIR:-./data}/archive:/data/archive:ro
+      - ${DATA_DIR:-./data}/db:/data/db
+      - ${DATA_DIR:-./data}/media:/data/media
+    ports:
+      - "${VIEWER_PORT:-8080}:8080"
+    networks:
+      - internal
+
+  # Optional: only started with `--profile tunnel`. Point the tunnel's public hostname at http://twitter-archive-viewer:8080
+  # TUNNEL_TOKEN is required for this service, but Compose cannot enforce that per profile (a `:?` check would break the default profile).
+  cloudflared:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    container_name: twitter-archive-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:-}
+    depends_on:
+      - viewer
+    networks:
+      - internal
+
+networks:
+  internal:

@@ -1,0 +1,18 @@
+{
+  "name": "twitter-archive-viewer",
+  "description": "Self-hosted viewer for your Twitter/X data archive (tweets, likes, DMs) with SQLite full-text search.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server/main.ts",
+    "import": "node --disable-warning=ExperimentalWarning src/import/cli.ts",
+    "build:web": "tsc -p web/tsconfig.json && node scripts/copy-static.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.0"
+  }
+}
